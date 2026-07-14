@@ -36,6 +36,9 @@ export interface RecipeIngredient {
   quantity?: number | null
   unit?: string | null
   preparation?: string | null
+  raw_text?: string | null
+  section?: string | null
+  alternate_group_id?: string | null
   in_pantry?: boolean
   match_status?: 'available' | 'insufficient' | 'unknown' | 'missing' | 'staple'
   pantry_quantity?: number | null
@@ -43,6 +46,13 @@ export interface RecipeIngredient {
   matched_via?: string | null
   conversion_basis?: string | null
   conversion_source?: string | null
+  alternates?: Array<{
+    ingredient_id?: string
+    name: string
+    quantity?: number | null
+    unit?: string | null
+    match_status?: string
+  }> | null
 }
 
 export interface RecipeStep {
@@ -57,6 +67,9 @@ export interface Nutrition {
   protein_g?: number | null
   carbs_g?: number | null
   fat_g?: number | null
+  source?: 'printed' | 'estimated' | 'manual' | string | null
+  basis?: 'per_serving' | 'whole_recipe' | string | null
+  coverage?: number | null
 }
 
 export interface Recipe {
@@ -68,6 +81,7 @@ export interface Recipe {
   source_url?: string | null
   source_page?: number | null
   image_url?: string | null
+  image_source?: string | null
   prep_time_minutes?: number | null
   cook_time_minutes?: number | null
   total_time_minutes?: number | null
@@ -79,6 +93,7 @@ export interface Recipe {
   nutrition?: Nutrition | null
   cookbook_id?: string
   cookbook_title?: string | null
+  parse_warnings?: string[]
 }
 
 export interface CursorPage<T> {

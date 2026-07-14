@@ -4,10 +4,17 @@ from pathlib import Path
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Resolve .env next to the backend package root so scripts work from any cwd.
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
+_ENV_FILE = _BACKEND_ROOT / ".env"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
+        env_file=_ENV_FILE,
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
     )
 
     app_name: str = "Recipe Finder"
@@ -30,6 +37,9 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.deepseek.com"
     openai_model: str = "deepseek-v4-flash"
+    usda_fdc_api_key: str | None = None
+    usda_fdc_base_url: str = "https://api.nal.usda.gov/fdc/v1"
+    nutrition_min_coverage: float = 0.6
     dev_sync_ingestion: bool = True
     auto_create_tables: bool = True
 

@@ -47,6 +47,25 @@ class UploadStatus(StrEnum):
     failed = "failed"
 
 
+class ImageSource(StrEnum):
+    extracted = "extracted"
+    category = "category"
+    generated = "generated"
+    user = "user"
+    none = "none"
+
+
+class NutritionSource(StrEnum):
+    printed = "printed"
+    estimated = "estimated"
+    manual = "manual"
+
+
+class NutritionBasis(StrEnum):
+    per_serving = "per_serving"
+    whole_recipe = "whole_recipe"
+
+
 class User(UUIDTimestampMixin, Base):
     __tablename__ = "users"
 
@@ -119,11 +138,23 @@ class Recipe(UUIDTimestampMixin, Base):
     protein_grams: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
     carbs_grams: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
     fat_grams: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    nutrition_source: Mapped[NutritionSource | None] = mapped_column(
+        Enum(NutritionSource, native_enum=False, length=20)
+    )
+    nutrition_basis: Mapped[NutritionBasis | None] = mapped_column(
+        Enum(NutritionBasis, native_enum=False, length=20)
+    )
+    nutrition_coverage: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
     cuisine: Mapped[str | None] = mapped_column(String(120))
     tags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     steps: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     source_page: Mapped[int | None] = mapped_column(Integer)
     parse_warnings: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    image_path: Mapped[str | None] = mapped_column(String(1024))
+    image_source: Mapped[ImageSource | None] = mapped_column(
+        Enum(ImageSource, native_enum=False, length=20)
+    )
+    image_key: Mapped[str | None] = mapped_column(String(64))
 
     cookbook: Mapped[Cookbook] = relationship(back_populates="recipes")
     recipe_ingredients: Mapped[list["RecipeIngredient"]] = relationship(
@@ -148,9 +179,36 @@ class Ingredient(UUIDTimestampMixin, Base):
     canonical_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("ingredients.id", ondelete="SET NULL")
     )
+    fdc_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    fdc_description: Mapped[str | None] = mapped_column(String(512))
+    calories_per_100g: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    protein_per_100g: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    carbs_per_100g: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    fat_per_100g: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
 
     recipe_ingredients: Mapped[list["RecipeIngredient"]] = relationship(back_populates="ingredient")
     pantry_items: Mapped[list["PantryItem"]] = relationship(back_populates="ingredient")
+
+
+class FoodNutritionCache(UUIDTimestampMixin, Base):
+    """Shared per-100g macros keyed by normalized food name (central USDA cache)."""
+
+    __tablename__ = "food_nutrition_cache"
+    __table_args__ = (
+        Index("ix_food_nutrition_cache_fdc_id", "fdc_id"),
+        Index("ix_food_nutrition_cache_found", "found"),
+    )
+
+    # Normalized query name, e.g. "yellow onion"
+    query_name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    found: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    fdc_id: Mapped[int | None] = mapped_column(Integer)
+    fdc_description: Mapped[str | None] = mapped_column(String(512))
+    calories_per_100g: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    protein_per_100g: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    carbs_per_100g: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    fat_per_100g: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="fdc")
 
 
 class RecipeIngredient(UUIDTimestampMixin, Base):

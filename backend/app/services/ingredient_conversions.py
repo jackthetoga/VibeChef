@@ -179,7 +179,14 @@ INGREDIENT_CONVERSIONS = (
         "canned tomatoes",
         "242",
         "canned with liquid",
-        aliases=("tomatoes, canned", "tinned tomatoes", "diced tomatoes"),
+        aliases=(
+            "tomatoes, canned",
+            "tinned tomatoes",
+            "diced tomatoes",
+            "canned plum tomatoes",
+            "canned imported italian plum tomatoes",
+            "imported italian plum tomatoes",
+        ),
     ),
     conversion(
         "tomato paste",

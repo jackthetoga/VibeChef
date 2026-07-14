@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse
 from sqlalchemy import (
     Integer,
     Text,
@@ -24,6 +25,11 @@ from sqlalchemy.orm import aliased, selectinload
 from app.api.deps import DB, CurrentUser
 from app.models import Cookbook, Ingredient, PantryItem, Recipe, RecipeIngredient
 from app.schemas.api import NutritionOut, RecipeListItem, RecipeOut, RecipePage
+from app.services.recipe_images import (
+    recipe_image_media_type,
+    recipe_image_url,
+    resolve_recipe_image_file,
+)
 from app.services.units import (
     compare_quantities,
     ingredient_conversion_for_units,
@@ -34,6 +40,31 @@ from app.services.units import (
 )
 
 router = APIRouter(prefix="/recipes", tags=["recipes"])
+
+
+def nutrition_out(recipe: Recipe) -> NutritionOut | None:
+    has_macros = any(
+        value is not None
+        for value in (
+            recipe.calories,
+            recipe.protein_grams,
+            recipe.carbs_grams,
+            recipe.fat_grams,
+        )
+    )
+    if not has_macros and recipe.nutrition_source is None:
+        return None
+    return NutritionOut(
+        calories=recipe.calories,
+        protein_g=recipe.protein_grams,
+        carbs_g=recipe.carbs_grams,
+        fat_g=recipe.fat_grams,
+        source=recipe.nutrition_source.value if recipe.nutrition_source else None,
+        basis=recipe.nutrition_basis.value if recipe.nutrition_basis else None,
+        coverage=recipe.nutrition_coverage,
+    )
+
+
 SortField = Literal["total_time", "calories", "protein", "missing_count", "created_at", "title"]
 SortOrder = Literal["asc", "desc"]
 
@@ -268,17 +299,14 @@ async def list_recipes(
             tags=recipe.tags,
             created_at=recipe.created_at,
             missing_count=int(missing_value or 0),
+            image_url=recipe_image_url(recipe.id, recipe.image_path),
+            image_source=recipe.image_source.value if recipe.image_source else None,
             prep_time_minutes=recipe.prep_minutes,
             cook_time_minutes=recipe.cook_minutes,
             total_time_minutes=recipe.total_minutes,
             missing_ingredients=int(missing_value or 0),
             makeable=int(missing_value or 0) == 0,
-            nutrition=NutritionOut(
-                calories=recipe.calories,
-                protein_g=recipe.protein_grams,
-                carbs_g=recipe.carbs_grams,
-                fat_g=recipe.fat_grams,
-            ),
+            nutrition=nutrition_out(recipe),
         )
         for recipe, missing_value, _, cookbook_title in rows
     ]
@@ -312,6 +340,8 @@ async def get_recipe(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> Recipe:
     recipe.total_time_minutes = recipe.total_minutes
     recipe.missing_ingredients = recipe.missing_count
     recipe.makeable = recipe.missing_count == 0
+    recipe.image_url = recipe_image_url(recipe.id, recipe.image_path)
+    recipe.image_source = recipe.image_source.value if recipe.image_source else None
     pantry_items = {
         item.ingredient.canonical_id or item.ingredient_id: item
         for item in await db.scalars(
@@ -425,10 +455,26 @@ async def get_recipe(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> Recipe:
         [ingredient_match(item) for item in recipe.recipe_ingredients]
     )
     recipe.parse_warnings = list(recipe.parse_warnings or [])
-    recipe.nutrition = {
-        "calories": recipe.calories,
-        "protein_g": recipe.protein_grams,
-        "carbs_g": recipe.carbs_grams,
-        "fat_g": recipe.fat_grams,
-    }
+    recipe.nutrition = nutrition_out(recipe)
     return recipe
+
+
+@router.get("/{recipe_id}/image")
+async def recipe_image(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> FileResponse:
+    row = (
+        await db.execute(
+            select(Recipe.image_path)
+            .join(Cookbook, Cookbook.id == Recipe.cookbook_id)
+            .where(Recipe.id == recipe_id, Cookbook.user_id == user.id)
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Recipe not found")
+    image_path = row[0]
+    if not image_path:
+        raise HTTPException(status_code=404, detail="Recipe image not found")
+    try:
+        path = resolve_recipe_image_file(image_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Recipe image not found") from exc
+    return FileResponse(path, media_type=recipe_image_media_type(image_path))

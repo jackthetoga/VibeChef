@@ -67,4 +67,30 @@ describe('API client authentication', () => {
     expect(sessionCleared).toHaveBeenCalledOnce()
     unsubscribe()
   })
+
+  it('stores the rotated token pair after a password change', async () => {
+    localStorage.setItem('recipe-finder.refresh-token', 'old-refresh')
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          access_token: 'fresh-access',
+          refresh_token: 'fresh-refresh',
+          token_type: 'bearer',
+          expires_in: 900,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+
+    await authApi.changePassword({
+      current_password: 'correct-horse-battery',
+      new_password: 'new-correct-horse-42',
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/auth/change-password'),
+      expect.objectContaining({ method: 'POST' }),
+    )
+    expect(localStorage.getItem('recipe-finder.refresh-token')).toBe('fresh-refresh')
+  })
 })

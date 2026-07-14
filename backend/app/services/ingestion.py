@@ -18,6 +18,7 @@ from app.db.session import SessionLocal
 from app.models import Cookbook, Ingredient, Recipe, RecipeIngredient, UploadStatus
 from app.services.canonicalize import canonicalize_ingredients, resolve_or_alternates
 from app.services.llm import chat_completion
+from app.services.nutrition import apply_printed_nutrition_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +367,16 @@ def _ingredient_name_from_remainder(remainder: str) -> str:
     return name
 
 
+def _normalize_known_ingredient_name(name: str) -> str:
+    """Collapse pantry-equivalent variants to stable matching names."""
+    words = set(re.findall(r"[a-z']+", name.lower()))
+    if ("tomato" in words or "tomatoes" in words) and (
+        "canned" in words or "tinned" in words
+    ):
+        return "canned tomatoes"
+    return name
+
+
 def _parse_ingredient_parts(raw: str) -> tuple[str, str, Decimal | None, str | None]:
     """Return (canonical_name, cleaned_raw, quantity, unit) without model validation."""
     cleaned = re.sub(r"^\s*(?:[•*-]|\d+[.)])\s*", "", raw).strip()
@@ -398,6 +409,7 @@ def _parse_ingredient_parts(raw: str) -> tuple[str, str, Decimal | None, str | N
     canonical = re.sub(r"[^a-zA-Z0-9' /-]", "", canonical).strip().lower()
     canonical = re.sub(r"\s+", " ", canonical) or cleaned.lower()
     canonical = _shorten_canonical_name(canonical) or cleaned.lower()[:MAX_CANONICAL_CHARS]
+    canonical = _normalize_known_ingredient_name(canonical)
     canonical = canonical[:255] or cleaned.lower()[:MAX_CANONICAL_CHARS]
     return canonical, cleaned, quantity, unit
 
@@ -1655,6 +1667,7 @@ async def process_cookbook(cookbook_id: str) -> None:
                         source_page=extracted_recipe.source_page,
                         parse_warnings=extracted_recipe.parse_warnings,
                     )
+                    apply_printed_nutrition_metadata(recipe)
                     db.add(recipe)
                     await db.flush()
                     group_ids: dict[str, uuid.UUID] = {}
@@ -1715,6 +1728,21 @@ async def process_cookbook(cookbook_id: str) -> None:
                 "Ingredient canonicalization failed for cookbook %s",
                 cookbook_id,
             )
+
+        try:
+            from app.services.recipe_images import assign_images_for_cookbook
+
+            await assign_images_for_cookbook(cookbook_id, path)
+        except Exception as exc:
+            # Imagery failure must not abort an otherwise successful ingest.
+            logger.warning("Recipe image assignment failed for %s: %s", cookbook_id, exc)
+
+        try:
+            from app.services.nutrition import estimate_nutrition_for_cookbook
+
+            await estimate_nutrition_for_cookbook(cookbook_id)
+        except Exception as exc:
+            logger.warning("Nutrition estimation failed for %s: %s", cookbook_id, exc)
 
         async with SessionLocal() as db:
             cookbook = await db.get(Cookbook, uuid.UUID(cookbook_id))

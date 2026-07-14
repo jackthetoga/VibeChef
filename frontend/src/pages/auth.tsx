@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { Link, useNavigate, useSearch } from '@tanstack/react-router'
 import { ArrowRight, ChefHat, KeyRound, LogOut, Mail, ShieldCheck, Sparkles, UserRound } from 'lucide-react'
+import { toast } from 'sonner'
+import { authApi } from '../lib/api/client'
 import { useAuth } from '../lib/auth'
 import { Button, Card, Field, Input } from '../components/ui'
 
@@ -70,7 +72,7 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }) {
           <form className="mt-8 grid gap-5" onSubmit={submit}>
             {register && <Field label="Name"><div className="relative"><UserRound className="absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-muted" /><Input className="pl-10" autoComplete="name" required value={name} onChange={(event) => setName(event.target.value)} placeholder="Alex Cook" /></div></Field>}
             <Field label="Email"><div className="relative"><Mail className="absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-muted" /><Input className="pl-10" type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" /></div></Field>
-            <Field label="Password" hint={register ? 'Use at least 8 characters.' : undefined}><div className="relative"><KeyRound className="absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-muted" /><Input className="pl-10" type="password" minLength={8} autoComplete={register ? 'new-password' : 'current-password'} required value={password} onChange={(event) => setPassword(event.target.value)} placeholder="••••••••" /></div></Field>
+            <Field label="Password" hint={register ? 'At least 8 characters. Avoid common passwords.' : undefined}><div className="relative"><KeyRound className="absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-muted" /><Input className="pl-10" type="password" minLength={8} maxLength={128} autoComplete={register ? 'new-password' : 'current-password'} required value={password} onChange={(event) => setPassword(event.target.value)} placeholder="••••••••" /></div></Field>
             {error && <p role="alert" className="rounded-xl bg-rose-100 p-3 text-sm font-semibold text-rose-800">{error}</p>}
             <Button className="mt-1 w-full" size="lg" type="submit" disabled={submitting}>
               {submitting ? 'One moment…' : register ? 'Create account' : 'Sign in'} <ArrowRight className="size-4" />
@@ -90,6 +92,40 @@ export function AuthPage({ mode }: { mode: 'login' | 'register' }) {
 export function AccountPage() {
   const { user, logout } = useAuth()
   const navigate = useNavigate()
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [passwordError, setPasswordError] = useState('')
+  const [changingPassword, setChangingPassword] = useState(false)
+
+  const changePassword = async (event: React.FormEvent) => {
+    event.preventDefault()
+    setPasswordError('')
+    if (newPassword !== confirmPassword) {
+      setPasswordError('New passwords do not match')
+      return
+    }
+    if (newPassword === currentPassword) {
+      setPasswordError('New password must be different from the current password')
+      return
+    }
+    setChangingPassword(true)
+    try {
+      await authApi.changePassword({
+        current_password: currentPassword,
+        new_password: newPassword,
+      })
+      setCurrentPassword('')
+      setNewPassword('')
+      setConfirmPassword('')
+      toast.success('Password updated. Other sessions were signed out.')
+    } catch (caught) {
+      setPasswordError(caught instanceof Error ? caught.message : 'Could not change password')
+    } finally {
+      setChangingPassword(false)
+    }
+  }
+
   return (
     <div className="mx-auto max-w-3xl p-4 sm:p-8 xl:p-10">
       <p className="mb-2 text-xs font-bold uppercase tracking-[.18em] text-terracotta">Settings</p>
@@ -102,6 +138,66 @@ export function AccountPage() {
         <div className="mt-7 border-t border-line pt-6">
           <Button variant="danger" onClick={async () => { await logout(); await navigate({ to: '/login' }) }}><LogOut className="size-4" /> Log out</Button>
         </div>
+      </Card>
+
+      <Card className="mt-6 p-6 sm:p-8">
+        <div className="flex items-start gap-3">
+          <span className="grid size-11 place-items-center rounded-2xl bg-sand text-sage-dark">
+            <KeyRound className="size-5" />
+          </span>
+          <div>
+            <h2 className="font-display text-2xl font-bold text-ink">Change password</h2>
+            <p className="mt-1 text-sm text-muted">
+              Use at least 8 characters. Changing your password signs out every other device.
+            </p>
+          </div>
+        </div>
+        <form className="mt-7 grid gap-5" onSubmit={changePassword}>
+          <Field label="Current password">
+            <Input
+              type="password"
+              autoComplete="current-password"
+              required
+              minLength={1}
+              maxLength={128}
+              value={currentPassword}
+              onChange={(event) => setCurrentPassword(event.target.value)}
+              placeholder="••••••••"
+            />
+          </Field>
+          <Field label="New password" hint="At least 8 characters. Avoid common passwords.">
+            <Input
+              type="password"
+              autoComplete="new-password"
+              required
+              minLength={8}
+              maxLength={128}
+              value={newPassword}
+              onChange={(event) => setNewPassword(event.target.value)}
+              placeholder="••••••••"
+            />
+          </Field>
+          <Field label="Confirm new password">
+            <Input
+              type="password"
+              autoComplete="new-password"
+              required
+              minLength={8}
+              maxLength={128}
+              value={confirmPassword}
+              onChange={(event) => setConfirmPassword(event.target.value)}
+              placeholder="••••••••"
+            />
+          </Field>
+          {passwordError && (
+            <p role="alert" className="rounded-xl bg-rose-100 p-3 text-sm font-semibold text-rose-800">
+              {passwordError}
+            </p>
+          )}
+          <Button type="submit" disabled={changingPassword}>
+            {changingPassword ? 'Updating…' : 'Update password'}
+          </Button>
+        </form>
       </Card>
     </div>
   )

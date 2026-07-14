@@ -1,7 +1,11 @@
 from app.models.entities import (
     Base,
     Cookbook,
+    FoodNutritionCache,
+    ImageSource,
     Ingredient,
+    NutritionBasis,
+    NutritionSource,
     PantryItem,
     Recipe,
     RecipeIngredient,
@@ -13,7 +17,11 @@ from app.models.entities import (
 __all__ = [
     "Base",
     "Cookbook",
+    "FoodNutritionCache",
+    "ImageSource",
     "Ingredient",
+    "NutritionBasis",
+    "NutritionSource",
     "PantryItem",
     "Recipe",
     "RecipeIngredient",

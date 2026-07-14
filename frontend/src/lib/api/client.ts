@@ -171,6 +171,14 @@ export const authApi = {
       clearSession()
     }
   },
+  async changePassword(input: { current_password: string; new_password: string }) {
+    const response = await request<AuthResponse>('/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+    saveTokens(response)
+    return response
+  },
 }
 
 export const recipesApi = {
@@ -178,6 +186,22 @@ export const recipesApi = {
     return page(await request<CursorPage<Recipe> | Recipe[]>(`/recipes${queryString(filters)}`))
   },
   get: (id: string) => request<Recipe>(`/recipes/${encodeURIComponent(id)}`),
+  async imageBlob(id: string) {
+    const response = await fetch(`${API_BASE}/recipes/${encodeURIComponent(id)}/image`, {
+      headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
+    })
+    if (response.status === 401) {
+      const token = await refreshAccessToken()
+      if (!token) throw new ApiError('Unauthorized', 401)
+      const retry = await fetch(`${API_BASE}/recipes/${encodeURIComponent(id)}/image`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!retry.ok) throw await parseError(retry)
+      return retry.blob()
+    }
+    if (!response.ok) throw await parseError(response)
+    return response.blob()
+  },
 }
 
 export const pantryApi = {

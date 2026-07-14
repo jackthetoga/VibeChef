@@ -314,6 +314,29 @@ def test_ingredient_parser_finds_noun_after_comma_separated_descriptors() -> Non
     assert demo_ingredient("2 tablespoons chopped parsley").canonical_name == "parsley"
 
 
+def test_canned_tomato_or_alternate_matches_canned_tomatoes_name() -> None:
+    """Fresh/canned tomato OR lines must expose a canned-tomatoes alternate for pantry match."""
+    from app.services.ingestion import parse_ingredient_line
+    from app.services.canonicalize import heuristic_canonical_name
+
+    raw = (
+        "2 pounds fresh, ripe tomatoes, prepared as described on this page or "
+        "2 cups canned imported Italian plum tomatoes, cut up, with their juice"
+    )
+    alternates = parse_ingredient_line(raw)
+    assert len(alternates) == 2
+    assert alternates[0].alternate_group == alternates[1].alternate_group
+    assert alternates[0].canonical_name == "tomatoes"
+    assert alternates[0].quantity == Decimal("2")
+    assert alternates[0].unit == "pounds"
+    assert alternates[1].canonical_name == "canned tomatoes"
+    assert alternates[1].quantity == Decimal("2")
+    assert alternates[1].unit == "cups"
+    assert (
+        heuristic_canonical_name("canned imported italian plum tomatoes") == "canned tomatoes"
+    )
+
+
 def test_meaty_ripe_red_bell_peppers_keeps_full_noun() -> None:
     """Regression: '3 meaty, ripe red bell peppers' must not collapse to 'meaty'."""
     from app.services.ingestion import (

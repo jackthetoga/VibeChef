@@ -17,7 +17,7 @@ import { toast } from 'sonner'
 import { pantryApi, recipesApi } from '../lib/api/client'
 import { formatMinutes } from '../lib/utils'
 import { formatQuantity } from '../lib/units'
-import { RecipeArt } from '../components/app-shell'
+import { RecipeImage } from '../components/app-shell'
 import { Badge, Button, Card, Skeleton } from '../components/ui'
 
 export function RecipeDetailPage() {
@@ -96,7 +96,11 @@ export function RecipeDetailPage() {
     data.total_time_minutes || (data.prep_time_minutes || 0) + (data.cook_time_minutes || 0)
   const missingNames = (data.ingredients || [])
     .filter((ingredient) => ingredient.match_status === 'missing' || ingredient.match_status === 'insufficient')
-    .map((ingredient) => ingredient.name)
+    .flatMap((ingredient) =>
+      ingredient.alternates?.length
+        ? ingredient.alternates.map((alternate) => alternate.name)
+        : [ingredient.name],
+    )
     .filter(Boolean)
 
   return (
@@ -105,7 +109,12 @@ export function RecipeDetailPage() {
         <ArrowLeft className="size-4" /> Back to recipes
       </Link>
       <div className="grid overflow-hidden rounded-3xl border border-line bg-white shadow-card md:grid-cols-[.85fr_1.15fr]">
-        <RecipeArt seed={data.id} className="min-h-72 md:min-h-[430px]" />
+        <RecipeImage
+          recipeId={data.id}
+          imageUrl={data.image_url}
+          seed={data.id}
+          className="min-h-72 md:min-h-[430px]"
+        />
         <div className="flex flex-col justify-center p-6 sm:p-10">
           <div className="mb-4 flex flex-wrap gap-2">
             <Badge tone={data.makeable ? 'green' : 'amber'}>
@@ -124,7 +133,13 @@ export function RecipeDetailPage() {
           <div className="mt-7 grid grid-cols-3 divide-x divide-line rounded-2xl bg-sand p-4 text-center">
             <div><Clock3 className="mx-auto mb-1 size-5 text-sage-dark" /><b className="text-sm text-ink">{formatMinutes(time)}</b><span className="block text-[11px] text-muted">Total time</span></div>
             <div><UsersRound className="mx-auto mb-1 size-5 text-sage-dark" /><b className="text-sm text-ink">{data.servings || '—'}</b><span className="block text-[11px] text-muted">Servings</span></div>
-            <div><Flame className="mx-auto mb-1 size-5 text-sage-dark" /><b className="text-sm text-ink">{data.nutrition?.calories ?? '—'}</b><span className="block text-[11px] text-muted">Calories</span></div>
+            <div>
+              <Flame className="mx-auto mb-1 size-5 text-sage-dark" />
+              <b className="text-sm text-ink">{data.nutrition?.calories ?? '—'}</b>
+              <span className="block text-[11px] text-muted">
+                {data.nutrition?.basis === 'whole_recipe' ? 'Calories (recipe)' : 'Calories'}
+              </span>
+            </div>
           </div>
           {missingNames.length > 0 && (
             <Button
@@ -152,8 +167,15 @@ export function RecipeDetailPage() {
                 {(data.ingredients || []).map((ingredient, index) => {
                   const inPantry = ingredient.in_pantry ?? false
                   const insufficient = ingredient.match_status === 'insufficient'
+                  const prevSection = index > 0 ? (data.ingredients || [])[index - 1]?.section : null
+                  const showSection = Boolean(ingredient.section && ingredient.section !== prevSection)
                   return (
                     <li key={`${ingredient.name}-${index}`}>
+                      {showSection && (
+                        <p className="mb-2 mt-3 text-xs font-semibold uppercase tracking-wide text-muted first:mt-0">
+                          {ingredient.section}
+                        </p>
+                      )}
                       <button
                         className={`flex w-full items-center gap-3 rounded-xl border p-3 text-left transition ${
                           inPantry
@@ -214,10 +236,33 @@ export function RecipeDetailPage() {
                 })}
               </ul>
             )}
+            {(data.parse_warnings || []).length > 0 && (
+              <p className="mt-4 text-xs text-muted">
+                Parse notes: {(data.parse_warnings || []).join(' · ')}
+              </p>
+            )}
           </Card>
           {data.nutrition && (
             <Card className="p-5 sm:p-7">
-              <h2 className="flex items-center gap-2 font-display text-xl font-bold text-ink"><Gauge className="size-5" /> Nutrition</h2>
+              <h2 className="flex items-center gap-2 font-display text-xl font-bold text-ink">
+                <Gauge className="size-5" /> Nutrition
+                {data.nutrition.source === 'estimated' && (
+                  <Badge tone="amber">Estimated</Badge>
+                )}
+                {data.nutrition.source === 'printed' && (
+                  <Badge tone="green">From cookbook</Badge>
+                )}
+              </h2>
+              <p className="mt-1 text-sm text-muted">
+                {data.nutrition.basis === 'per_serving'
+                  ? 'Values are per serving.'
+                  : data.nutrition.basis === 'whole_recipe'
+                    ? 'Values are for the whole recipe.'
+                    : null}
+                {data.nutrition.source === 'estimated' && data.nutrition.coverage != null
+                  ? ` Coverage ${Math.round(Number(data.nutrition.coverage) * 100)}%.`
+                  : null}
+              </p>
               <div className="mt-4 grid grid-cols-4 gap-2 text-center">
                 {[
                   ['Protein', data.nutrition.protein_g, 'g'],

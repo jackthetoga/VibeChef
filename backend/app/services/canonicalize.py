@@ -36,6 +36,16 @@ def normalize_ingredient_name(value: object) -> str:
     return " ".join(str(value or "").lower().strip().split())
 
 
+def heuristic_canonical_name(name: str) -> str | None:
+    """Deterministic mappings for pantry-critical variants the LLM may miss."""
+    words = set(re.findall(r"[a-z']+", normalize_ingredient_name(name)))
+    if ("tomato" in words or "tomatoes" in words) and (
+        "canned" in words or "tinned" in words
+    ):
+        return "canned tomatoes"
+    return None
+
+
 def _candidate_tokens(names: list[str]) -> set[str]:
     return {
         token
@@ -92,13 +102,16 @@ def _canonicalization_prompt(
         "input is merely a variety or grade of the same ingredient.\n"
         "- When a source line offers true substitutes (fresh tomatoes or canned tomatoes), "
         "canonicalize the input name itself; do not invent a second option here.\n"
+        "- Canned/tinned tomato products (including plum, diced, crushed, imported Italian) "
+        "canonicalize to canned tomatoes, not fresh tomatoes or plain plum tomatoes.\n"
         "- Prefer an exact name from EXISTING CANONICALS when it applies. Otherwise return a "
         "short, lowercase ingredient noun phrase.\n"
         "- Use the optional source line for context when the input name is truncated or messy.\n"
         "- Include every input exactly once. Return JSON only.\n\n"
         "Examples:\n"
         '{"coconut milk":"coconut milk","extra virgin olive oil":"olive oil",'
-        '"vegetable oil":"vegetable oil","chopped parsley":"parsley"}\n\n'
+        '"vegetable oil":"vegetable oil","chopped parsley":"parsley",'
+        '"canned imported italian plum tomatoes":"canned tomatoes"}\n\n'
         f"EXISTING CANONICALS:\n{json.dumps(candidates, ensure_ascii=False)}\n\n"
         f"INPUTS:\n{numbered}"
     )
@@ -305,14 +318,28 @@ async def canonicalize_ingredients(
     raw_hints: dict[str, str] | None = None,
 ) -> None:
     """Resolve ingredients to stable canonical roots without failing the caller."""
-    if not settings.openai_api_key:
-        return
-
     by_name = {
         normalize_ingredient_name(ingredient.name): ingredient
         for ingredient in ingredients
         if ingredient.canonical_id is None and normalize_ingredient_name(ingredient.name)
     }
+    # Deterministic mappings first (works without an API key).
+    for name, ingredient in list(by_name.items()):
+        hint = (raw_hints or {}).get(name, "")
+        heuristic = heuristic_canonical_name(name) or heuristic_canonical_name(hint)
+        if heuristic is None:
+            continue
+        root = await _find_or_create_root(db, heuristic, ingredient)
+        ingredient.canonical_id = root.id
+        if ingredient.name != root.name:
+            root.aliases = sorted(set(root.aliases + [ingredient.name]))
+        root.category = root.category or ingredient.category
+        root.staple = root.staple or ingredient.staple
+        by_name.pop(name, None)
+
+    if not settings.openai_api_key or not by_name:
+        return
+
     unresolved = list(by_name)
     for offset in range(0, len(unresolved), BATCH_SIZE):
         names = unresolved[offset : offset + BATCH_SIZE]
@@ -332,6 +359,10 @@ async def canonicalize_ingredients(
             mapping = _parse_mapping(raw, names)
             for name in names:
                 canonical_name = mapping.get(name)
+                hint = (raw_hints or {}).get(name, "")
+                heuristic = heuristic_canonical_name(name) or heuristic_canonical_name(hint)
+                if heuristic is not None:
+                    canonical_name = heuristic
                 if canonical_name is None:
                     logger.warning("Canonicalization omitted ingredient %r", name)
                     continue

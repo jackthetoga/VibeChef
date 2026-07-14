@@ -116,7 +116,7 @@ export function LibraryPage() {
   const retry = useMutation({
     mutationFn: cookbooksApi.retry,
     onSuccess: () => {
-      toast.success('Re-import started')
+      toast.success('Reingest started')
       void client.invalidateQueries({ queryKey: ['cookbooks'] })
     },
     onError: (error) => toast.error(error.message),
@@ -234,32 +234,30 @@ export function LibraryPage() {
                     ) : failed ? (
                       <div className="grid gap-3">
                         <p className="flex items-start gap-1.5 text-xs font-semibold text-rose-700">
-                          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" /> {book.error || 'Import failed. Try again or remove this book.'}
+                          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" /> {book.error || 'Import failed. Reingest or remove this book.'}
                         </p>
-                        <div className="flex flex-wrap gap-2">
-                          <Button
-                            size="sm"
-                            variant="secondary"
-                            disabled={retry.isPending}
-                            onClick={() => retry.mutate(book.id)}
-                          >
-                            <RefreshCw className={`size-3.5 ${retry.isPending ? 'animate-spin' : ''}`} />
-                            Retry import
-                          </Button>
-                          <Button size="sm" variant="danger" onClick={() => setPendingRemove(book)}>
-                            <Trash2 className="size-3.5" /> Remove
-                          </Button>
-                        </div>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          disabled={retry.isPending}
+                          onClick={() => retry.mutate(book.id)}
+                        >
+                          <RefreshCw className={`size-3.5 ${retry.isPending ? 'animate-spin' : ''}`} />
+                          Reingest
+                        </Button>
                       </div>
                     ) : (
                       <div className="flex items-center justify-between gap-2">
                         <p className="flex items-center gap-1.5 text-xs font-bold text-leaf-dark"><CheckCircle2 className="size-4" /> Ready to cook</p>
-                        <button
-                          className="text-xs font-bold text-muted hover:text-rose-700"
-                          onClick={() => setPendingRemove(book)}
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          disabled={retry.isPending}
+                          onClick={() => retry.mutate(book.id)}
                         >
-                          Remove
-                        </button>
+                          <RefreshCw className={`size-3.5 ${retry.isPending ? 'animate-spin' : ''}`} />
+                          Reingest
+                        </Button>
                       </div>
                     )}
                   </div>

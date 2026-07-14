@@ -1,5 +1,7 @@
 import { Link, Outlet, useNavigate, useRouterState } from '@tanstack/react-router'
 import { BookOpen, ChefHat, CookingPot, LogOut, Refrigerator, UserRound } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { recipesApi } from '../lib/api/client'
 import { useAuth } from '../lib/auth'
 import { cn } from '../lib/utils'
 import { Button } from './ui'
@@ -142,4 +144,51 @@ export function RecipeArt({ seed = 'herbs', className }: { seed?: string; classN
       <ChefHat className="absolute left-1/2 top-1/2 size-12 -translate-x-1/2 -translate-y-1/2 text-ink/15" />
     </div>
   )
+}
+
+export function RecipeImage({
+  recipeId,
+  imageUrl,
+  seed,
+  className,
+}: {
+  recipeId: string
+  imageUrl?: string | null
+  seed?: string
+  className?: string
+}) {
+  const [src, setSrc] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!imageUrl) {
+      setSrc(null)
+      return
+    }
+    let objectUrl: string | null = null
+    let cancelled = false
+    void recipesApi
+      .imageBlob(recipeId)
+      .then((blob) => {
+        if (cancelled) return
+        objectUrl = URL.createObjectURL(blob)
+        setSrc(objectUrl)
+      })
+      .catch(() => {
+        if (!cancelled) setSrc(null)
+      })
+    return () => {
+      cancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [recipeId, imageUrl])
+
+  if (src) {
+    return (
+      <div className={cn('relative isolate overflow-hidden bg-sand', className)}>
+        <img src={src} alt="" className="size-full object-cover" />
+      </div>
+    )
+  }
+
+  return <RecipeArt seed={seed || recipeId} className={className} />
 }

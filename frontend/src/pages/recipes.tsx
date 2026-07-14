@@ -14,7 +14,7 @@ import {
 import { cookbooksApi, recipesApi } from '../lib/api/client'
 import type { Recipe, RecipeFilters } from '../lib/api/types'
 import { formatMinutes, useDebouncedValue } from '../lib/utils'
-import { RecipeArt } from '../components/app-shell'
+import { RecipeImage } from '../components/app-shell'
 import { Badge, Button, Card, Dialog, Input, Select, Skeleton } from '../components/ui'
 
 const cuisines = ['', 'Italian', 'Mexican', 'Mediterranean', 'Asian', 'Indian', 'American']
@@ -125,7 +125,12 @@ export function RecipeCard({ recipe }: { recipe: Recipe }) {
   return (
     <Link to="/recipes/$recipeId" params={{ recipeId: recipe.id }} className="group block">
       <Card className="h-full overflow-hidden transition duration-300 hover:-translate-y-1 hover:shadow-lg">
-        <RecipeArt seed={recipe.id || recipe.title} className="aspect-[16/10] border-b border-line" />
+        <RecipeImage
+          recipeId={recipe.id}
+          imageUrl={recipe.image_url}
+          seed={recipe.id || recipe.title}
+          className="aspect-[16/10] border-b border-line"
+        />
         <div className="p-4">
           <div className="mb-3 flex items-center justify-between gap-2">
             <Badge tone={recipe.makeable || missing === 0 ? 'green' : 'amber'}>
@@ -153,6 +158,7 @@ export function RecipeCard({ recipe }: { recipe: Recipe }) {
             </span>
             <span className="flex items-center gap-1.5">
               <Utensils className="size-4" /> {recipe.nutrition?.protein_g ?? '—'}g protein
+              {recipe.nutrition?.source === 'estimated' ? ' · est.' : ''}
             </span>
           </div>
         </div>

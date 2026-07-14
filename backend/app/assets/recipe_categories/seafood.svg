@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" role="img" aria-label="Seafood">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f8f5ed"/>
+      <stop offset="100%" stop-color="#eee9dc"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="500" fill="url(#bg)"/>
+  <circle cx="120" cy="90" r="70" fill="#fff" fill-opacity=".45"/>
+  <circle cx="700" cy="420" r="90" fill="#7d9b78" fill-opacity=".12"/>
+  <ellipse cx="400" cy="300" rx="150" ry="70" fill="#7d9b78"/><path d="M520 300c40-40 70-20 90 0-20 20-50 40-90 0z" fill="#b65b3d"/><circle cx="340" cy="285" r="10" fill="#f8f5ed"/><path d="M280 270c-20 10-30 30-20 45M270 310c20 10 40 5 55-10" fill="none" stroke="#25312c" stroke-width="6" stroke-linecap="round"/>
+</svg>

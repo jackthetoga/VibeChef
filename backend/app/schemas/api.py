@@ -307,6 +307,9 @@ class NutritionOut(BaseModel):
     protein_g: Decimal | None
     carbs_g: Decimal | None
     fat_g: Decimal | None
+    source: str | None = None
+    basis: str | None = None
+    coverage: Decimal | None = None
 
 
 class RecipeOut(ORMModel):
@@ -329,6 +332,8 @@ class RecipeOut(ORMModel):
     created_at: datetime
     recipe_ingredients: list[RecipeIngredientOut]
     parse_warnings: list[str] = Field(default_factory=list)
+    image_url: str | None = None
+    image_source: str | None = None
     missing_count: int = 0
     prep_time_minutes: int | None = None
     cook_time_minutes: int | None = None
@@ -351,6 +356,8 @@ class RecipeListItem(ORMModel):
     tags: list[str]
     created_at: datetime
     missing_count: int
+    image_url: str | None = None
+    image_source: str | None = None
     prep_time_minutes: int | None = None
     cook_time_minutes: int | None = None
     total_time_minutes: int | None = None

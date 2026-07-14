@@ -19,6 +19,7 @@ from app.core.config import settings
 from app.models import Cookbook, Recipe, UploadStatus
 from app.schemas.api import CookbookOut, Message
 from app.services.ingestion import cover_media_type, process_cookbook
+from app.services.recipe_images import delete_cookbook_recipe_images
 
 router = APIRouter(prefix="/cookbooks", tags=["cookbooks"])
 
@@ -261,6 +262,7 @@ async def delete_cookbook(cookbook_id: uuid.UUID, db: DB, user: CurrentUser) -> 
     cookbook = await owned_cookbook(db, user.id, cookbook_id)
     storage_path = Path(cookbook.storage_path)
     cover_relative = cookbook.cover_path
+    cookbook_id_str = str(cookbook.id)
     await db.delete(cookbook)
     await db.commit()
     storage_path.unlink(missing_ok=True)
@@ -269,4 +271,5 @@ async def delete_cookbook(cookbook_id: uuid.UUID, db: DB, user: CurrentUser) -> 
             resolve_cover_file(cover_relative).unlink(missing_ok=True)
         except HTTPException:
             pass
+    delete_cookbook_recipe_images(cookbook_id_str)
     return Message(detail="Cookbook deleted")
