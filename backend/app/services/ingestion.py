@@ -16,14 +16,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models import Cookbook, Ingredient, Recipe, RecipeIngredient, UploadStatus
-from app.services.canonicalize import canonicalize_ingredients
+from app.services.canonicalize import canonicalize_ingredients, resolve_or_alternates
 from app.services.llm import chat_completion
 
 logger = logging.getLogger(__name__)
 
 MAX_CHUNK_CHARS = 24_000
 MAX_CANONICAL_CHARS = 80
-MAX_CANONICAL_WORDS = 8
+MAX_CANONICAL_WORDS = 12
+AMOUNT_TOKEN = r"(?:\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?)"
 EPUB_NOISE_NAME_TOKENS = (
     "toc",
     "nav",
@@ -60,21 +61,40 @@ INGREDIENT_DESCRIPTORS = frozenset(
     {
         "black",
         "boiling",
+        "brown",
+        "cleaned",
         "crusted",
         "firm",
         "fresh",
         "good",
-        "quality",
+        "green",
+        "hot",
+        "imported",
+        "italian",
+        "juicy",
         "large",
+        "lean",
+        "meaty",
         "medium",
+        "mild",
         "old",
+        "orange",
+        "plump",
+        "purple",
+        "quality",
+        "red",
         "ripe",
         "round",
         "small",
+        "smoked",
+        "sweet",
+        "tender",
         "thick",
         "toasting",
+        "unshelled",
         "waxy",
         "white",
+        "whole",
         "yellow",
     }
 )
@@ -125,6 +145,9 @@ class ExtractedIngredient(BaseModel):
     aliases: list[str] = Field(default_factory=list)
     category: str | None = Field(default=None, max_length=120)
     staple: bool = False
+    alternate_group: str | None = None
+    section: str | None = Field(default=None, max_length=255)
+    ambiguous_or: bool = False
 
     @field_validator("canonical_name", mode="before")
     @classmethod
@@ -145,7 +168,7 @@ class ExtractedIngredient(BaseModel):
             if fallback and not _canonical_looks_like_prose(fallback):
                 name = fallback
             else:
-                name = " ".join(name.split()[:MAX_CANONICAL_WORDS])[:MAX_CANONICAL_CHARS].strip()
+                name = _shorten_canonical_name(name)
         if not name:
             name = (
                 _short_name_from_raw(self.raw_text)
@@ -172,6 +195,7 @@ class ExtractedRecipe(BaseModel):
     steps: list[str] = Field(default_factory=list)
     source_page: int | None = Field(default=None, ge=1)
     ingredients: list[ExtractedIngredient] = Field(default_factory=list)
+    parse_warnings: list[str] = Field(default_factory=list)
 
     @field_validator("title", mode="before")
     @classmethod
@@ -190,6 +214,28 @@ class ExtractionEnvelope(BaseModel):
 def _canonical_looks_like_prose(name: str) -> bool:
     words = name.split()
     return len(name) > MAX_CANONICAL_CHARS or len(words) > MAX_CANONICAL_WORDS
+
+
+def _shorten_canonical_name(name: str) -> str:
+    """Prefer a food noun over blind mid-phrase truncation."""
+    cleaned = " ".join(name.split())
+    # Drop leaked quantified alternates only, not variety phrases like "red or green …"
+    cleaned = re.split(
+        rf"\s+or\s+{AMOUNT_TOKEN}\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip()
+    cleaned = re.split(
+        r"\b(?:chopped|diced|minced|sliced|peeled|drained|cut up|with their)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" ,")
+    words = cleaned.split()
+    if len(words) > MAX_CANONICAL_WORDS:
+        cleaned = " ".join(words[:MAX_CANONICAL_WORDS])
+    return cleaned[:MAX_CANONICAL_CHARS].strip()
 
 
 def _normalize_amount_text(value: str) -> str:
@@ -246,9 +292,31 @@ def parse_servings(text: str) -> Decimal | None:
     return low
 
 
+def _strip_leading_descriptors(name: str) -> str:
+    words = name.split()
+    while len(words) > 1:
+        leading_parts = re.findall(r"[a-z]+", words[0].lower())
+        if not leading_parts or not all(part in INGREDIENT_DESCRIPTORS for part in leading_parts):
+            break
+        words.pop(0)
+    return " ".join(words)
+
+
+def _segment_is_descriptor_only(segment: str) -> bool:
+    words = re.findall(r"[A-Za-z']+", segment.lower())
+    return bool(words) and all(word in INGREDIENT_DESCRIPTORS for word in words)
+
+
 def _ingredient_name_from_remainder(remainder: str) -> str:
     """Keep comma-separated descriptors until the actual ingredient noun appears."""
     remainder = re.sub(r"\([^)]*\)", "", remainder).strip()
+    # Drop dimensional prefixes: "A 1/2-inch-thick slice of prosciutto" → "prosciutto…"
+    remainder = re.sub(
+        r"(?i)^(?:a|an)\s+(?:\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?)-inch(?:-thick)?\s+"
+        r"(?:slice\s+of\s+)?",
+        "",
+        remainder,
+    ).strip()
     segments = [segment.strip() for segment in remainder.split(",") if segment.strip()]
     if not segments:
         return remainder
@@ -257,8 +325,7 @@ def _ingredient_name_from_remainder(remainder: str) -> str:
     crossed_descriptor_comma = False
     for segment in segments:
         selected.append(segment)
-        words = re.findall(r"[A-Za-z']+", segment.lower())
-        if words and all(word in INGREDIENT_DESCRIPTORS for word in words):
+        if _segment_is_descriptor_only(segment):
             crossed_descriptor_comma = True
             continue
         break
@@ -276,16 +343,26 @@ def _ingredient_name_from_remainder(remainder: str) -> str:
         maxsplit=1,
         flags=re.I,
     )[0].strip()
+    # Drop size ranges and processing-state prefixes: "small to medium whole squid" → "squid"
+    name = re.sub(
+        r"(?i)^(?:(?:small|medium|large)(?:\s+to\s+(?:small|medium|large))?|whole|cleaned|"
+        r"unshelled)(?:\s+(?:small|medium|large|whole|cleaned|unshelled))*\s+",
+        "",
+        name,
+    ).strip()
     if crossed_descriptor_comma:
-        words = name.split()
-        while len(words) > 1:
-            leading_parts = re.findall(r"[a-z]+", words[0].lower())
-            if not leading_parts or not all(
-                part in INGREDIENT_DESCRIPTORS for part in leading_parts
-            ):
-                break
-            words.pop(0)
-        name = " ".join(words)
+        name = _strip_leading_descriptors(name)
+
+    # If comma-walking left only descriptors (e.g. stopped too early), use the final noun phrase.
+    name_words = re.findall(r"[a-z']+", name.lower())
+    if not name_words or set(name_words).issubset(INGREDIENT_DESCRIPTORS):
+        name = _strip_leading_descriptors(segments[-1])
+        name = re.split(
+            r"\b(?:chopped|diced|minced|sliced|peeled|pitted|trimmed|to taste)\b",
+            name,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip()
     return name
 
 
@@ -295,13 +372,13 @@ def _parse_ingredient_parts(raw: str) -> tuple[str, str, Decimal | None, str | N
     cleaned = re.sub(r"\s+", " ", cleaned)
     amount_source = _normalize_amount_text(cleaned)
     amount_match = re.match(
-        r"^(\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?)\s*",
+        rf"^({AMOUNT_TOKEN})\s*",
         amount_source,
     )
     quantity = parse_number(amount_match.group(1)) if amount_match else None
     remainder = amount_source[amount_match.end() :] if amount_match else amount_source
     remainder = re.sub(
-        r"^(?:or|to|-|–|—)\s*(?:\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?)\s*",
+        rf"^(?:or|to|-|–|—)\s*{AMOUNT_TOKEN}\s*",
         "",
         remainder,
         flags=re.I,
@@ -309,12 +386,104 @@ def _parse_ingredient_parts(raw: str) -> tuple[str, str, Decimal | None, str | N
     unit_match = re.match(rf"^({UNIT_PATTERN})\b\.?\s*", remainder, flags=re.I)
     unit = unit_match.group(1).lower() if unit_match else None
     name_part = remainder[unit_match.end() :] if unit_match else remainder
+    # Safety: if an unsplit quantified alternate leaked into the name, keep the first branch.
+    name_part = re.split(
+        rf"\s+or\s+{AMOUNT_TOKEN}\b",
+        name_part,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
     canonical = _ingredient_name_from_remainder(name_part)
-    canonical = re.sub(r"[^a-zA-Z0-9' -]", "", canonical).strip().lower()
+    # Keep fraction slashes so "1/2-inch" does not collapse to "12-inch".
+    canonical = re.sub(r"[^a-zA-Z0-9' /-]", "", canonical).strip().lower()
     canonical = re.sub(r"\s+", " ", canonical) or cleaned.lower()
-    canonical = " ".join(canonical.split()[:MAX_CANONICAL_WORDS])[:MAX_CANONICAL_CHARS].strip()
+    canonical = _shorten_canonical_name(canonical) or cleaned.lower()[:MAX_CANONICAL_CHARS]
     canonical = canonical[:255] or cleaned.lower()[:MAX_CANONICAL_CHARS]
     return canonical, cleaned, quantity, unit
+
+
+def _is_quantity_range_or(raw: str) -> bool:
+    """True for lines like '1 or 2 celery stalks' (not ingredient alternates)."""
+    normalized = _normalize_amount_text(raw)
+    return bool(
+        re.match(
+            rf"^{AMOUNT_TOKEN}\s+or\s+{AMOUNT_TOKEN}\b",
+            normalized,
+            flags=re.I,
+        )
+    )
+
+
+def _looks_like_variety_or(left: str, right: str) -> bool:
+    """True for color/variety choices like 'red or green bell peppers'."""
+    color_pattern = "|".join(sorted({"black", "brown", "green", "orange", "purple", "red", "white", "yellow"}))
+    return bool(
+        re.search(
+            rf"(?i)\b(?:{color_pattern})\b.+\b(?:{color_pattern})\b",
+            f"{left} or {right}",
+        )
+    )
+
+
+def _split_quantified_or_segments(raw: str) -> list[str] | None:
+    """Split '2 lb X or 3 cups Y' (and shared-qty 'N cup X or canned Y') into segments."""
+    if _is_quantity_range_or(raw):
+        return None
+    normalized = _normalize_amount_text(raw)
+    pattern = re.compile(rf"\s+or\s+(?={AMOUNT_TOKEN}\b)", flags=re.I)
+    matches = list(pattern.finditer(normalized))
+    if matches:
+        left = normalized[: matches[0].start()].strip()
+        # Incomplete left side means a quantity range that slipped past the earlier check.
+        if re.fullmatch(rf"{AMOUNT_TOKEN}", left, flags=re.I):
+            return None
+        if not re.search(rf"{AMOUNT_TOKEN}\s+(?:{UNIT_PATTERN})\b|[A-Za-z]", left, flags=re.I):
+            return None
+        segments: list[str] = []
+        previous = 0
+        for match in matches:
+            segment = normalized[previous : match.start()].strip(" ,;")
+            if segment:
+                segments.append(segment)
+            previous = match.end()
+        tail = normalized[previous:].strip(" ,;")
+        if tail:
+            segments.append(tail)
+        return segments if len(segments) >= 2 else None
+
+    # Shared quantity: "3/4 cup fresh tomatoes ... or canned imported ... tomatoes"
+    shared = re.search(
+        rf"\s+or\s+(?!{AMOUNT_TOKEN}\b)(?=[A-Za-z])",
+        normalized,
+        flags=re.I,
+    )
+    if not shared:
+        return None
+    left = normalized[: shared.start()].strip(" ,;")
+    right = normalized[shared.end() :].strip(" ,;")
+    if not re.match(rf"^{AMOUNT_TOKEN}\b", left, flags=re.I):
+        return None
+    if _looks_like_variety_or(left, right):
+        return None
+    if len(right.split()) < 2:
+        return None
+    amount_match = re.match(rf"^({AMOUNT_TOKEN})\s*", left, flags=re.I)
+    if not amount_match:
+        return None
+    remainder = left[amount_match.end() :]
+    unit_match = re.match(rf"^({UNIT_PATTERN})\b\.?\s*", remainder, flags=re.I)
+    prefix_end = amount_match.end() + (unit_match.end() if unit_match else 0)
+    prefix = left[:prefix_end].strip()
+    if not prefix:
+        return None
+    return [left, f"{prefix} {right}".strip()]
+
+
+def _has_ambiguous_or(raw: str) -> bool:
+    """True when 'or' joins varieties/substitutes without separate quantities."""
+    if _split_quantified_or_segments(raw) is not None or _is_quantity_range_or(raw):
+        return False
+    return bool(re.search(r"(?i)\bor\b", raw))
 
 
 def _short_name_from_raw(raw_text: str) -> str:
@@ -483,7 +652,14 @@ def _repair_ingredient(ingredient: ExtractedIngredient) -> ExtractedIngredient:
     name_words = set(ingredient.canonical_name.lower().split())
     if name_words and not name_words.issubset(INGREDIENT_DESCRIPTORS):
         return ingredient
-    return demo_ingredient(ingredient.raw_text)
+    repaired = demo_ingredient(ingredient.raw_text)
+    return repaired.model_copy(
+        update={
+            "alternate_group": ingredient.alternate_group,
+            "section": ingredient.section,
+            "ambiguous_or": ingredient.ambiguous_or,
+        }
+    )
 
 
 def _ingredient_key(ingredient: ExtractedIngredient) -> str:
@@ -527,7 +703,10 @@ def _apply_variation_omissions(
     omission_texts = [
         match.group(1)
         for match in re.finditer(
-            r"(?i)\bomit\s+(.+?)(?=\.|;|\band (?:add|drizzle|replace|substitute|use)\b|"
+            r"(?i)\bomit\s+(.+?)(?="
+            r"\s+from the (?:previous|preceding) recipe|"
+            r"[.,;]|"
+            r"\band (?:add|drizzle|replace|substitute|use)\b|"
             r"\bfollow\b|$)",
             instructions,
         )
@@ -591,17 +770,115 @@ def _resolve_context_ingredients(
     return _merge_ingredients(inherited, concrete + additions)
 
 
+TITLE_AUDIT_STOPWORDS = frozenset(
+    {
+        "a",
+        "alla",
+        "alle",
+        "alternative",
+        "and",
+        "basic",
+        "con",
+        "di",
+        "for",
+        "from",
+        "in",
+        "of",
+        "only",
+        "or",
+        "recipe",
+        "style",
+        "the",
+        "to",
+        "tuscan",
+        "uses",
+        "variation",
+        "version",
+        "with",
+        "without",
+    }
+)
+TITLE_AUDIT_METHODS = frozenset(
+    {
+        "baked",
+        "braised",
+        "broiled",
+        "fried",
+        "grilled",
+        "marinated",
+        "poached",
+        "roasted",
+        "sauteed",
+        "sautéed",
+        "simmered",
+        "smothered",
+        "steamed",
+        "stuffed",
+    }
+)
+
+
+def _title_food_tokens(title: str) -> list[str]:
+    primary = re.split(r"\s+[—–-]\s+", title, maxsplit=1)[0]
+    tokens = [
+        token.rstrip("s")
+        for token in re.findall(r"[A-Za-z']+", primary.lower())
+        if len(token) > 3
+        and token not in TITLE_AUDIT_STOPWORDS
+        and token not in TITLE_AUDIT_METHODS
+        and token not in INGREDIENT_DESCRIPTORS
+    ]
+    # Prefer distinctive tokens; drop very generic dish carriers unless alone.
+    generic = {"pasta", "soup", "sauce", "salad", "bread", "pizza", "risotto", "stew"}
+    distinctive = [token for token in tokens if token not in generic]
+    return distinctive or tokens
+
+
+def _flag_title_ingredient_gaps(recipe: ExtractedRecipe) -> list[str]:
+    """Flag title food nouns absent from ingredient text. Never invent ingredients."""
+    corpus = " ".join(
+        f"{item.canonical_name} {item.raw_text}" for item in recipe.ingredients
+    ).lower()
+    corpus_tokens = {word.rstrip("s") for word in re.findall(r"[a-z']+", corpus)}
+    warnings: list[str] = []
+    for token in _title_food_tokens(recipe.title):
+        if token not in corpus_tokens:
+            warnings.append(
+                f'title mentions "{token}" but no matching ingredient was parsed'
+            )
+    return warnings
+
+
 def quality_assure_recipes(recipes: list[ExtractedRecipe]) -> list[ExtractedRecipe]:
     """Repair suspicious ingredient names and reject incomplete recipe records."""
     accepted: list[ExtractedRecipe] = []
     for recipe in recipes:
-        ingredients: list[ExtractedIngredient] = []
-        seen_rows: set[tuple[str, str]] = set()
+        expanded_source: list[ExtractedIngredient] = []
         for original in recipe.ingredients:
+            # Re-run line parsing so LLM/demo output also gets quantified OR splits.
+            if original.alternate_group or (
+                not _has_ambiguous_or(original.raw_text)
+                and _split_quantified_or_segments(original.raw_text) is None
+            ):
+                expanded_source.append(original)
+            else:
+                expanded_source.extend(
+                    parse_ingredient_line(original.raw_text, section=original.section)
+                )
+
+        ingredients: list[ExtractedIngredient] = []
+        seen_rows: set[tuple[str, str, str | None]] = set()
+        for original in expanded_source:
             ingredient = _repair_ingredient(original)
             if not _ingredient_is_valid(ingredient):
                 continue
-            row_key = (_ingredient_key(ingredient), ingredient.raw_text.lower())
+            row_key = (
+                _ingredient_key(ingredient),
+                ingredient.raw_text.lower(),
+                ingredient.alternate_group,
+                str(ingredient.quantity),
+                ingredient.unit,
+            )
             if row_key in seen_rows:
                 continue
             seen_rows.add(row_key)
@@ -617,7 +894,20 @@ def quality_assure_recipes(recipes: list[ExtractedRecipe]) -> list[ExtractedReci
                 bool(unresolved_context),
             )
             continue
-        accepted.append(recipe.model_copy(update={"title": title, "ingredients": ingredients}))
+        warnings = list(recipe.parse_warnings) + _flag_title_ingredient_gaps(
+            recipe.model_copy(update={"title": title, "ingredients": ingredients})
+        )
+        for warning in warnings:
+            logger.info("Recipe parse warning for %r: %s", title, warning)
+        accepted.append(
+            recipe.model_copy(
+                update={
+                    "title": title,
+                    "ingredients": ingredients,
+                    "parse_warnings": warnings,
+                }
+            )
+        )
     return deduplicate_recipes(accepted)
 
 
@@ -626,7 +916,7 @@ def _finalize_structured_recipe(
     title: str,
     yield_text: str | None,
     variation_body: list[str],
-    ingredient_lines: list[str],
+    ingredient_lines: list[tuple[str | None, str]],
     steps: list[str],
 ) -> ExtractedRecipe | None:
     title = " ".join(title.split()).strip()
@@ -640,11 +930,11 @@ def _finalize_structured_recipe(
     # Variation write-ups often put the full method in prose instead of numbered steps.
     if not cleaned_steps and variation_body:
         cleaned_steps = [note.strip() for note in variation_body if note.strip()]
-    ingredients = [
-        demo_ingredient(line)
-        for line in ingredient_lines
-        if line.strip() and not _is_non_ingredient_line(line)
-    ]
+    ingredients: list[ExtractedIngredient] = []
+    for section, line in ingredient_lines:
+        if not line.strip() or _is_non_ingredient_line(line):
+            continue
+        ingredients.extend(parse_ingredient_line(line, section=section))
     if not ingredients and not cleaned_steps:
         return None
     return ExtractedRecipe(
@@ -662,8 +952,9 @@ def _parse_structured_epub_document(content: bytes | str) -> list[ExtractedRecip
     current_title: str | None = None
     yield_text: str | None = None
     variation_body: list[str] = []
-    ingredient_lines: list[str] = []
+    ingredient_lines: list[tuple[str | None, str]] = []
     steps: list[str] = []
+    current_section: str | None = None
     current_is_variation = False
     primary_title: str | None = None
     primary_recipe: ExtractedRecipe | None = None
@@ -671,7 +962,7 @@ def _parse_structured_epub_document(content: bytes | str) -> list[ExtractedRecip
 
     def flush() -> None:
         nonlocal current_title, yield_text, variation_body, ingredient_lines, steps
-        nonlocal current_is_variation, primary_recipe, previous_recipe
+        nonlocal current_section, current_is_variation, primary_recipe, previous_recipe
         if current_title is None:
             return
         recipe = _finalize_structured_recipe(
@@ -682,7 +973,9 @@ def _parse_structured_epub_document(content: bytes | str) -> list[ExtractedRecip
             steps=steps,
         )
         if recipe is not None:
-            source_text = " ".join(ingredient_lines + variation_body + steps)
+            source_text = " ".join(
+                [line for _, line in ingredient_lines] + variation_body + steps
+            )
             reference_dependent = (
                 not recipe.ingredients and bool(CONTEXT_REFERENCE_RE.search(source_text))
             )
@@ -707,6 +1000,7 @@ def _parse_structured_epub_document(content: bytes | str) -> list[ExtractedRecip
         variation_body = []
         ingredient_lines = []
         steps = []
+        current_section = None
         current_is_variation = False
 
     for tag in soup.find_all(["p", "h1", "h2", "h3", "h4"]):
@@ -729,10 +1023,13 @@ def _parse_structured_epub_document(content: bytes | str) -> list[ExtractedRecip
 
         if classes & RECIPE_YIELD_CLASSES:
             yield_text = text
+        elif classes & RECIPE_INGREDIENT_HEADER_CLASSES:
+            # Section labels only — never treated as ingredients.
+            current_section = text.rstrip(":").strip()[:255] or None
         elif classes & RECIPE_VARIATION_BODY_CLASSES:
             variation_body.append(text)
         elif classes & RECIPE_INGREDIENT_CLASSES:
-            ingredient_lines.append(text)
+            ingredient_lines.append((current_section, text))
         elif classes & RECIPE_STEP_CLASSES:
             steps.append(text)
         # Headnotes (rhn*) and notes (rn*) are skipped: essays reuse those classes.
@@ -753,7 +1050,7 @@ def extract_structured_epub_recipes(path: Path) -> list[ExtractedRecipe] | None:
     recipes: list[ExtractedRecipe] = []
     for item in _iter_epub_documents(book):
         recipes.extend(_parse_structured_epub_document(item.get_content()))
-    return quality_assure_recipes(recipes)
+    return expand_ambiguous_or_ingredients_sync(quality_assure_recipes(recipes))
 
 
 def _read_text_file(path: Path) -> str:
@@ -915,6 +1212,131 @@ def demo_ingredient(raw: str) -> ExtractedIngredient:
     )
 
 
+async def expand_ambiguous_or_ingredients(
+    recipes: list[ExtractedRecipe],
+) -> list[ExtractedRecipe]:
+    """Expand ambiguous OR lines into alternate groups via LLM or heuristics."""
+    ambiguous: list[ExtractedIngredient] = [
+        ingredient
+        for recipe in recipes
+        for ingredient in recipe.ingredients
+        if ingredient.ambiguous_or
+    ]
+    if not ambiguous:
+        return recipes
+
+    fallback_names = {
+        " ".join(ingredient.raw_text.split()): ingredient.canonical_name
+        for ingredient in ambiguous
+    }
+    mapping = await resolve_or_alternates(
+        list(fallback_names),
+        fallback_names,
+    )
+    return _apply_or_alternate_mapping(recipes, mapping)
+
+
+def expand_ambiguous_or_ingredients_sync(
+    recipes: list[ExtractedRecipe],
+) -> list[ExtractedRecipe]:
+    """Heuristic-only expansion for sync extraction paths and tests."""
+    from app.services.canonicalize import heuristic_or_alternates
+
+    ambiguous = [
+        ingredient
+        for recipe in recipes
+        for ingredient in recipe.ingredients
+        if ingredient.ambiguous_or
+    ]
+    if not ambiguous:
+        return recipes
+    mapping = {
+        " ".join(ingredient.raw_text.split()): heuristic_or_alternates(
+            ingredient.raw_text,
+            ingredient.canonical_name,
+        )
+        for ingredient in ambiguous
+    }
+    return _apply_or_alternate_mapping(recipes, mapping)
+
+
+def _apply_or_alternate_mapping(
+    recipes: list[ExtractedRecipe],
+    mapping: dict[str, list[str]],
+) -> list[ExtractedRecipe]:
+    expanded_recipes: list[ExtractedRecipe] = []
+    for recipe in recipes:
+        ingredients: list[ExtractedIngredient] = []
+        for ingredient in recipe.ingredients:
+            if not ingredient.ambiguous_or:
+                ingredients.append(ingredient)
+                continue
+            key = " ".join(ingredient.raw_text.split())
+            names = mapping.get(key) or [ingredient.canonical_name]
+            group = ingredient.alternate_group or str(uuid.uuid4())
+            if len(names) == 1:
+                ingredients.append(
+                    ingredient.model_copy(
+                        update={
+                            "canonical_name": names[0],
+                            "alternate_group": None,
+                            "ambiguous_or": False,
+                        }
+                    )
+                )
+                continue
+            for name in names:
+                ingredients.append(
+                    ingredient.model_copy(
+                        update={
+                            "canonical_name": name,
+                            "alternate_group": group,
+                            "ambiguous_or": False,
+                        }
+                    )
+                )
+        expanded_recipes.append(recipe.model_copy(update={"ingredients": ingredients}))
+    return expanded_recipes
+
+
+def parse_ingredient_line(
+    raw: str,
+    *,
+    section: str | None = None,
+) -> list[ExtractedIngredient]:
+    """Parse one source line into one or more ingredients (quantified OR → alternates)."""
+    cleaned = re.sub(r"\s+", " ", raw).strip()
+    segments = _split_quantified_or_segments(cleaned)
+    if segments:
+        group = str(uuid.uuid4())
+        alternates: list[ExtractedIngredient] = []
+        for segment in segments:
+            ingredient = demo_ingredient(segment)
+            alternates.append(
+                ingredient.model_copy(
+                    update={
+                        "raw_text": cleaned,
+                        "alternate_group": group,
+                        "section": section,
+                        "ambiguous_or": False,
+                    }
+                )
+            )
+        return alternates
+
+    ingredient = demo_ingredient(cleaned)
+    ambiguous = _has_ambiguous_or(cleaned)
+    return [
+        ingredient.model_copy(
+            update={
+                "section": section,
+                "ambiguous_or": ambiguous,
+                "alternate_group": str(uuid.uuid4()) if ambiguous else None,
+            }
+        )
+    ]
+
+
 def demo_parse(text: str) -> list[ExtractedRecipe]:
     lines = [line.strip() for line in text.splitlines()]
     ingredient_indexes = [
@@ -970,11 +1392,14 @@ def demo_parse(text: str) -> list[ExtractedRecipe]:
             ),
             None,
         )
+        ingredients: list[ExtractedIngredient] = []
+        for line in ingredient_lines:
+            ingredients.extend(parse_ingredient_line(line))
         recipes.append(
             ExtractedRecipe(
                 title=title[:255],
                 source_page=int(page_match.group(1)) if page_match else None,
-                ingredients=[demo_ingredient(line) for line in ingredient_lines],
+                ingredients=ingredients,
                 steps=steps,
             )
         )
@@ -1192,6 +1617,7 @@ async def process_cookbook(cookbook_id: str) -> None:
                     )
                 await set_progress(cookbook_id, 15 + int(55 * (index + 1) / len(chunks)))
         extracted = quality_assure_recipes(extracted)
+        extracted = await expand_ambiguous_or_ingredients(extracted)
         if not extracted:
             raise ValueError("No recipes could be identified")
 
@@ -1202,6 +1628,7 @@ async def process_cookbook(cookbook_id: str) -> None:
                     return
                 await db.execute(delete(Recipe).where(Recipe.cookbook_id == cookbook.id))
                 ingredient_cache: dict[str, Ingredient] = {}
+                raw_hints: dict[str, str] = {}
                 for extracted_recipe in extracted:
                     total = extracted_recipe.total_minutes
                     if total is None and (
@@ -1226,15 +1653,26 @@ async def process_cookbook(cookbook_id: str) -> None:
                         tags=extracted_recipe.tags,
                         steps=extracted_recipe.steps,
                         source_page=extracted_recipe.source_page,
+                        parse_warnings=extracted_recipe.parse_warnings,
                     )
                     db.add(recipe)
                     await db.flush()
-                    for position, extracted_ingredient in enumerate(extracted_recipe.ingredients):
+                    group_ids: dict[str, uuid.UUID] = {}
+                    for position, extracted_ingredient in enumerate(
+                        extracted_recipe.ingredients
+                    ):
                         name = extracted_ingredient.canonical_name
                         ingredient = ingredient_cache.get(name)
                         if ingredient is None:
                             ingredient = await resolve_ingredient(db, extracted_ingredient)
                             ingredient_cache[name] = ingredient
+                        raw_hints.setdefault(name, extracted_ingredient.raw_text)
+                        alternate_group_id = None
+                        if extracted_ingredient.alternate_group:
+                            alternate_group_id = group_ids.setdefault(
+                                extracted_ingredient.alternate_group,
+                                uuid.uuid4(),
+                            )
                         db.add(
                             RecipeIngredient(
                                 recipe_id=recipe.id,
@@ -1243,6 +1681,8 @@ async def process_cookbook(cookbook_id: str) -> None:
                                 unit=extracted_ingredient.unit,
                                 raw_text=extracted_ingredient.raw_text,
                                 position=position,
+                                alternate_group_id=alternate_group_id,
+                                section=extracted_ingredient.section,
                             )
                         )
                 cookbook.status = UploadStatus.processing
@@ -1263,7 +1703,12 @@ async def process_cookbook(cookbook_id: str) -> None:
                     )
                 )
                 ingredients = list(result.unique())
-                await canonicalize_ingredients(db, ingredients, timeout=120.0)
+                await canonicalize_ingredients(
+                    db,
+                    ingredients,
+                    timeout=120.0,
+                    raw_hints=raw_hints,
+                )
                 await db.commit()
         except Exception:
             logger.exception(

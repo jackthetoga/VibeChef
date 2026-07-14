@@ -158,3 +158,88 @@ async def test_canonical_variant_matches_pantry_ingredient(
     assert detail.json()["missing_count"] == 0
     assert ingredient["match_status"] == "available"
     assert ingredient["matched_via"] == "olive oil"
+
+
+@pytest.mark.asyncio
+async def test_or_alternate_group_uses_any_matching(client: AsyncClient) -> None:
+    import uuid
+
+    registration = await client.post(
+        "/api/v1/auth/register",
+        json={"email": "or-match@example.com", "password": "password-123"},
+    )
+    headers = {"Authorization": f"Bearer {registration.json()['access_token']}"}
+
+    async with SessionLocal() as db:
+        user = await db.scalar(select(User).where(User.email == "or-match@example.com"))
+        cookbook = Cookbook(
+            user_id=user.id,
+            title="OR Recipes",
+            original_filename="or.pdf",
+            content_type="application/pdf",
+            storage_path="/tmp/or.pdf",
+        )
+        plum = Ingredient(name="plum tomatoes")
+        canned = Ingredient(name="canned tomatoes")
+        oil = Ingredient(name="olive oil", staple=True)
+        db.add_all([cookbook, plum, canned, oil])
+        await db.flush()
+        plum.canonical_id = plum.id
+        canned.canonical_id = canned.id
+        oil.canonical_id = oil.id
+
+        recipe = Recipe(cookbook_id=cookbook.id, title="Marinara")
+        db.add(recipe)
+        await db.flush()
+        group_id = uuid.uuid4()
+        db.add_all(
+            [
+                RecipeIngredient(
+                    recipe_id=recipe.id,
+                    ingredient_id=plum.id,
+                    quantity=2,
+                    unit="pounds",
+                    raw_text="2 pounds plum tomatoes or 3 cups canned tomatoes",
+                    position=0,
+                    alternate_group_id=group_id,
+                ),
+                RecipeIngredient(
+                    recipe_id=recipe.id,
+                    ingredient_id=canned.id,
+                    quantity=3,
+                    unit="cups",
+                    raw_text="2 pounds plum tomatoes or 3 cups canned tomatoes",
+                    position=1,
+                    alternate_group_id=group_id,
+                ),
+                RecipeIngredient(
+                    recipe_id=recipe.id,
+                    ingredient_id=oil.id,
+                    quantity=3,
+                    unit="tablespoons",
+                    raw_text="3 tablespoons olive oil",
+                    position=2,
+                ),
+            ]
+        )
+        await db.commit()
+        canned_id = canned.id
+        recipe_id = recipe.id
+
+    before = await client.get(f"/api/v1/recipes/{recipe_id}", headers=headers)
+    assert before.status_code == 200
+    assert before.json()["missing_count"] == 1
+    assert len(before.json()["ingredients"]) == 2
+    assert " or " in before.json()["ingredients"][0]["name"]
+
+    pantry = await client.post(
+        "/api/v1/pantry",
+        headers=headers,
+        json={"ingredient_id": str(canned_id), "quantity": 3, "unit": "cups"},
+    )
+    assert pantry.status_code == 201
+
+    after = await client.get(f"/api/v1/recipes/{recipe_id}", headers=headers)
+    assert after.status_code == 200
+    assert after.json()["missing_count"] == 0
+    assert after.json()["ingredients"][0]["match_status"] == "available"

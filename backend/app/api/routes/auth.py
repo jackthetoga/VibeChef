@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB, CurrentUser
@@ -18,6 +18,7 @@ from app.models import RefreshToken, User
 from app.schemas.api import (
     LoginRequest,
     Message,
+    PasswordChangeRequest,
     RefreshRequest,
     TokenPair,
     UserCreate,
@@ -34,8 +35,8 @@ def expired(value: datetime) -> bool:
 
 
 async def issue_pair(db: DB, user: User, user_agent: str | None) -> TokenPair:
-    access, expires_in = create_access_token(user.id)
-    refresh, jti, expires_at = create_refresh_token(user.id)
+    access, expires_in = create_access_token(user.id, user.credentials_version)
+    refresh, jti, expires_at = create_refresh_token(user.id, user.credentials_version)
     db.add(
         RefreshToken(
             user_id=user.id,
@@ -108,9 +109,18 @@ async def refresh(
     user = await db.get(User, user_id)
     if user is None or not user.is_active:
         raise HTTPException(status_code=401, detail="User is unavailable")
+    try:
+        token_version = int(payload.get("cv") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token") from None
+    if token_version != user.credentials_version:
+        raise HTTPException(status_code=401, detail="Refresh token has been revoked")
 
-    access, expires_in = create_access_token(user.id)
-    refresh_token, new_jti, expires_at = create_refresh_token(user.id)
+    access, expires_in = create_access_token(user.id, user.credentials_version)
+    refresh_token, new_jti, expires_at = create_refresh_token(
+        user.id,
+        user.credentials_version,
+    )
     replacement = RefreshToken(
         user_id=user.id,
         jti_hash=token_fingerprint(new_jti),
@@ -150,3 +160,26 @@ async def logout(body: RefreshRequest, db: DB, user: CurrentUser) -> Message:
 @router.get("/me", response_model=UserOut)
 async def me(user: CurrentUser) -> User:
     return user
+
+
+@router.post("/change-password", response_model=TokenPair)
+async def change_password(
+    body: PasswordChangeRequest,
+    db: DB,
+    user: CurrentUser,
+    user_agent: str | None = Header(default=None),
+) -> TokenPair:
+    if not verify_password(body.current_password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    user.password_hash = hash_password(body.new_password)
+    user.credentials_version = (user.credentials_version or 0) + 1
+    now = datetime.now(UTC)
+    await db.execute(
+        update(RefreshToken)
+        .where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=now)
+    )
+    await db.commit()
+    await db.refresh(user)
+    return await issue_pair(db, user, user_agent)

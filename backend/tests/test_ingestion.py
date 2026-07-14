@@ -314,6 +314,154 @@ def test_ingredient_parser_finds_noun_after_comma_separated_descriptors() -> Non
     assert demo_ingredient("2 tablespoons chopped parsley").canonical_name == "parsley"
 
 
+def test_meaty_ripe_red_bell_peppers_keeps_full_noun() -> None:
+    """Regression: '3 meaty, ripe red bell peppers' must not collapse to 'meaty'."""
+    from app.services.ingestion import (
+        _parse_structured_epub_document,
+        expand_ambiguous_or_ingredients_sync,
+        parse_ingredient_line,
+        quality_assure_recipes,
+    )
+
+    parsed = parse_ingredient_line("3 meaty, ripe red bell peppers")
+    assert len(parsed) == 1
+    assert parsed[0].canonical_name == "bell peppers"
+    assert parsed[0].quantity == Decimal("3")
+    assert parsed[0].canonical_name != "meaty"
+
+    # Full structured-EPUB path used by cookbook reingest.
+    content = """
+    <html><body>
+      <p class="rt">Peas, Peppers, and Prosciutto Sauce with Cream</p>
+      <p class="ry">For 4 to 6 servings</p>
+      <p class="rilf">3 meaty, ripe red bell peppers</p>
+      <p class="ril">3 tablespoons butter</p>
+      <p class="ril">1 cup tiny frozen peas, thawed</p>
+      <p class="rill">1 cup heavy whipping cream</p>
+      <p class="rp">1. Cook.</p>
+    </body></html>
+    """
+    recipes = expand_ambiguous_or_ingredients_sync(
+        quality_assure_recipes(_parse_structured_epub_document(content))
+    )
+    assert len(recipes) == 1
+    names = [item.canonical_name for item in recipes[0].ingredients]
+    assert "bell peppers" in names
+    assert "meaty" not in names
+    pepper = next(item for item in recipes[0].ingredients if item.canonical_name == "bell peppers")
+    assert pepper.quantity == Decimal("3")
+    assert pepper.raw_text == "3 meaty, ripe red bell peppers"
+
+
+def test_quantified_or_splits_into_alternate_group() -> None:
+    from app.services.ingestion import parse_ingredient_line
+
+    squid = parse_ingredient_line(
+        "2½ pounds small to medium whole squid or 2 pounds cleaned squid, sliced into rings"
+    )
+    assert len(squid) == 2
+    assert squid[0].alternate_group == squid[1].alternate_group
+    assert squid[0].canonical_name == "squid"
+    assert squid[0].quantity == Decimal("2.5")
+    assert squid[0].unit == "pounds"
+    assert squid[1].canonical_name == "squid"
+    assert squid[1].quantity == Decimal("2")
+
+    marinara = parse_ingredient_line(
+        "2 pounds fresh, ripe, firm plum tomatoes (see note on this page ) or "
+        "3 cups canned imported Italian plum tomatoes, drained and cut up"
+    )
+    assert len(marinara) == 2
+    assert marinara[0].canonical_name == "plum tomatoes"
+    assert "tomato" in marinara[1].canonical_name
+    assert marinara[1].quantity == Decimal("3")
+    assert marinara[1].unit == "cups"
+
+    peas = parse_ingredient_line(
+        "2 pounds unshelled fresh peas or 1 ten-ounce package frozen peas, thawed"
+    )
+    assert len(peas) == 2
+    assert "pea" in peas[0].canonical_name
+    assert "pea" in peas[1].canonical_name
+
+
+def test_quantity_range_and_color_or_are_not_false_split() -> None:
+    from app.services.ingestion import (
+        expand_ambiguous_or_ingredients_sync,
+        parse_ingredient_line,
+    )
+
+    celery = parse_ingredient_line("1 or 2 celery stalks")
+    assert len(celery) == 1
+    assert celery[0].canonical_name == "celery stalks"
+    assert celery[0].quantity == Decimal("1")
+
+    peppers = parse_ingredient_line("red or green bell peppers")
+    assert len(peppers) == 1
+    assert peppers[0].ambiguous_or is True
+    expanded = expand_ambiguous_or_ingredients_sync(
+        [
+            ExtractedRecipe(
+                title="Peppers",
+                ingredients=peppers,
+                steps=["Cook."],
+            )
+        ]
+    )
+    assert len(expanded[0].ingredients) == 1
+    assert "bell pepper" in expanded[0].ingredients[0].canonical_name
+
+
+def test_variation_omit_does_not_swallow_following_ingredients() -> None:
+    from app.services.ingestion import _apply_variation_omissions
+
+    base = [
+        demo_ingredient("2½ pounds small to medium whole squid"),
+        demo_ingredient("2 pounds unshelled fresh peas"),
+        demo_ingredient("3 tablespoons extra virgin olive oil"),
+    ]
+    # Force clean names as after OR split
+    base[0] = base[0].model_copy(update={"canonical_name": "squid"})
+    base[1] = base[1].model_copy(update={"canonical_name": "peas"})
+    kept = _apply_variation_omissions(
+        base,
+        "Omit the peas from the previous recipe, and when the squid is done, chop it.",
+    )
+    names = {item.canonical_name for item in kept}
+    assert "squid" in names
+    assert "peas" not in names
+    assert "extra virgin olive oil" in names
+
+
+def test_rilh_section_headers_attach_without_becoming_ingredients() -> None:
+    from app.services.ingestion import (
+        _parse_structured_epub_document,
+        expand_ambiguous_or_ingredients_sync,
+        quality_assure_recipes,
+    )
+
+    content = """
+    <html><body>
+      <p class="rt">Pizza Dough</p>
+      <p class="rilh">For the topping</p>
+      <p class="rilf">2 pounds plum tomatoes</p>
+      <p class="rill">3 tablespoons olive oil</p>
+      <p class="rp">1. Bake.</p>
+    </body></html>
+    """
+    recipes = expand_ambiguous_or_ingredients_sync(
+        quality_assure_recipes(_parse_structured_epub_document(content))
+    )
+    assert len(recipes) == 1
+    pizza = recipes[0]
+    assert [item.canonical_name for item in pizza.ingredients] == [
+        "plum tomatoes",
+        "olive oil",
+    ]
+    assert all(item.section == "For the topping" for item in pizza.ingredients)
+    assert not any(item.canonical_name == "for the topping" for item in pizza.ingredients)
+
+
 HAZAN_EPUB = Path(
     "/Users/zizizink/Library/Mobile Documents/com~apple~CloudDocs/Downloads/"
     " Marcella Hazan - Essentials of Classic Italian Cooking _ A Cookbook "
@@ -349,6 +497,36 @@ def test_hazan_epub_structured_parse_recovers_full_cookbook() -> None:
         for recipe in recipes
         for item in recipe.ingredients
     )
+    squid = by_title["Squid with Tomatoes and Peas, Tuscan Style"]
+    squid_names = {item.canonical_name for item in squid.ingredients}
+    assert any("squid" in name for name in squid_names)
+    assert any("pea" in name for name in squid_names)
+    assert any(
+        item.alternate_group and "squid" in item.canonical_name
+        for item in squid.ingredients
+    )
+    variation = by_title[
+        "Squid with Tomatoes and Peas, Tuscan Style — Alternative Uses for Squid and Tomatoes"
+    ]
+    variation_names = {item.canonical_name for item in variation.ingredients}
+    assert any("squid" in name for name in variation_names)
+    assert not any("pea" in name for name in variation_names)
+    marinara = by_title["Marinara Topping: Garlic, Tomatoes, and Olive Oil"]
+    marinara_names = {item.canonical_name for item in marinara.ingredients}
+    assert any("tomato" in name for name in marinara_names)
+    assert any(
+        item.alternate_group and "tomato" in item.canonical_name
+        for item in marinara.ingredients
+    )
+    peas_peppers = by_title["Peas, Peppers, and Prosciutto Sauce with Cream"]
+    peas_peppers_names = [item.canonical_name for item in peas_peppers.ingredients]
+    assert "bell peppers" in peas_peppers_names
+    assert "meaty" not in peas_peppers_names
+    pepper = next(
+        item for item in peas_peppers.ingredients if item.canonical_name == "bell peppers"
+    )
+    assert pepper.quantity == Decimal("3")
+    assert pepper.raw_text.startswith("3 meaty")
 
 
 def test_extraction_envelope_ignores_extra_llm_fields() -> None:

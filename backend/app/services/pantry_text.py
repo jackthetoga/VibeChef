@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 Action = Literal["add", "remove"]
 MAX_CANONICAL_CHARS = 80
-MAX_CANONICAL_WORDS = 8
+MAX_CANONICAL_WORDS = 12
 
 REMOVE_PREFIXES = (
     r"used|removed|ate|finished|threw\s+away|threw\s+out|tossed|ran\s+out\s+of|"

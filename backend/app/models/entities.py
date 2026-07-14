@@ -54,6 +54,7 @@ class User(UUIDTimestampMixin, Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(120))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    credentials_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     cookbooks: Mapped[list["Cookbook"]] = relationship(
         back_populates="owner", cascade="all, delete-orphan"
@@ -122,6 +123,7 @@ class Recipe(UUIDTimestampMixin, Base):
     tags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     steps: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     source_page: Mapped[int | None] = mapped_column(Integer)
+    parse_warnings: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
 
     cookbook: Mapped[Cookbook] = relationship(back_populates="recipes")
     recipe_ingredients: Mapped[list["RecipeIngredient"]] = relationship(
@@ -169,6 +171,8 @@ class RecipeIngredient(UUIDTimestampMixin, Base):
     unit: Mapped[str | None] = mapped_column(String(80))
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
     position: Mapped[int] = mapped_column(Integer, nullable=False)
+    alternate_group_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    section: Mapped[str | None] = mapped_column(String(255))
 
     recipe: Mapped[Recipe] = relationship(back_populates="recipe_ingredients")
     ingredient: Mapped[Ingredient] = relationship(back_populates="recipe_ingredients")

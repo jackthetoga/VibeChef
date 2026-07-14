@@ -13,6 +13,7 @@ from pydantic import (
     model_validator,
 )
 
+from app.core.security import validate_password_strength
 from app.models import UploadStatus
 
 
@@ -29,10 +30,31 @@ class UserCreate(BaseModel):
         validation_alias=AliasChoices("display_name", "name"),
     )
 
+    @field_validator("password")
+    @classmethod
+    def password_strength(cls, value: str) -> str:
+        return validate_password_strength(value)
+
 
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def password_strength(cls, value: str) -> str:
+        return validate_password_strength(value)
+
+    @model_validator(mode="after")
+    def passwords_must_differ(self) -> "PasswordChangeRequest":
+        if self.current_password == self.new_password:
+            raise ValueError("New password must be different from the current password")
+        return self
 
 
 class UserOut(ORMModel):
@@ -256,6 +278,8 @@ class RecipeIngredientOut(ORMModel):
     unit: str | None
     raw_text: str
     position: int
+    alternate_group_id: UUID | None = None
+    section: str | None = None
 
 
 class RecipeIngredientCompat(BaseModel):
@@ -265,6 +289,9 @@ class RecipeIngredientCompat(BaseModel):
     quantity: Decimal | None
     unit: str | None
     preparation: str | None = None
+    raw_text: str | None = None
+    section: str | None = None
+    alternate_group_id: UUID | None = None
     in_pantry: bool
     match_status: Literal["available", "insufficient", "unknown", "missing", "staple"]
     pantry_quantity: Decimal | None = None
@@ -272,6 +299,7 @@ class RecipeIngredientCompat(BaseModel):
     matched_via: str | None = None
     conversion_basis: str | None = None
     conversion_source: str | None = None
+    alternates: list[dict[str, object]] | None = None
 
 
 class NutritionOut(BaseModel):
@@ -300,6 +328,7 @@ class RecipeOut(ORMModel):
     source_page: int | None
     created_at: datetime
     recipe_ingredients: list[RecipeIngredientOut]
+    parse_warnings: list[str] = Field(default_factory=list)
     missing_count: int = 0
     prep_time_minutes: int | None = None
     cook_time_minutes: int | None = None

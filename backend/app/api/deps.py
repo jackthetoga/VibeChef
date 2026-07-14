@@ -27,10 +27,13 @@ async def get_current_user(
     try:
         payload = decode_token(credentials.credentials, "access")
         user_id = UUID(payload["sub"])
-    except (ValueError, KeyError):
+        token_version = int(payload.get("cv") or 0)
+    except (ValueError, KeyError, TypeError):
         raise unauthorized from None
     user = await db.get(User, user_id)
     if user is None or not user.is_active:
+        raise unauthorized
+    if token_version != user.credentials_version:
         raise unauthorized
     return user
 

@@ -86,7 +86,9 @@ def pantry_quantity_match_expression(ingredient_name):
 
 
 def missing_count_expression(user_id: uuid.UUID):
+    """Count unsatisfied ingredient groups (OR alternates use ANY matching)."""
     pantry_ingredient = aliased(Ingredient)
+    group_key = func.coalesce(RecipeIngredient.alternate_group_id, RecipeIngredient.id)
     in_pantry = exists(
         select(literal(1))
         .select_from(PantryItem)
@@ -98,17 +100,30 @@ def missing_count_expression(user_id: uuid.UUID):
             pantry_quantity_match_expression(Ingredient.name),
         )
     )
-    return (
-        select(func.count(RecipeIngredient.id))
+    total_groups = (
+        select(func.count(func.distinct(group_key)))
+        .select_from(RecipeIngredient)
         .join(Ingredient, Ingredient.id == RecipeIngredient.ingredient_id)
         .where(
             RecipeIngredient.recipe_id == Recipe.id,
             Ingredient.staple.is_(False),
-            ~in_pantry,
         )
         .correlate(Recipe)
         .scalar_subquery()
     )
+    satisfied_groups = (
+        select(func.count(func.distinct(group_key)))
+        .select_from(RecipeIngredient)
+        .join(Ingredient, Ingredient.id == RecipeIngredient.ingredient_id)
+        .where(
+            RecipeIngredient.recipe_id == Recipe.id,
+            Ingredient.staple.is_(False),
+            in_pantry,
+        )
+        .correlate(Recipe)
+        .scalar_subquery()
+    )
+    return total_groups - satisfied_groups
 
 
 def encode_cursor(value: object, recipe_id: uuid.UUID) -> str:
@@ -343,6 +358,9 @@ async def get_recipe(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> Recipe:
             "quantity": item.quantity,
             "unit": item.unit,
             "preparation": None,
+            "raw_text": item.raw_text,
+            "section": item.section,
+            "alternate_group_id": item.alternate_group_id,
             "in_pantry": match_status not in {"missing", "insufficient"},
             "match_status": match_status,
             "pantry_quantity": pantry_item.quantity if pantry_item else None,
@@ -355,12 +373,58 @@ async def get_recipe(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> Recipe:
             ),
             "conversion_basis": conversion_profile.basis if conversion_profile else None,
             "conversion_source": conversion_profile.source_url if conversion_profile else None,
+            "alternates": None,
         }
 
-    recipe.ingredients = [
-        ingredient_match(item)
-        for item in recipe.recipe_ingredients
-    ]
+    def collapse_or_groups(
+        matched: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Collapse OR alternates into one display row with ANY match semantics."""
+        groups: dict[object, list[dict[str, object]]] = {}
+        order: list[object] = []
+        for row in matched:
+            key = row.get("alternate_group_id") or row["id"]
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(row)
+
+        collapsed: list[dict[str, object]] = []
+        for key in order:
+            members = groups[key]
+            if len(members) == 1 or members[0].get("alternate_group_id") is None:
+                collapsed.append(members[0])
+                continue
+            status_rank = {
+                "available": 0,
+                "staple": 1,
+                "unknown": 2,
+                "insufficient": 3,
+                "missing": 4,
+            }
+            best = min(members, key=lambda row: status_rank.get(str(row["match_status"]), 9))
+            names = [str(member["name"]) for member in members]
+            display = best.copy()
+            display["name"] = " or ".join(names)
+            display["match_status"] = best["match_status"]
+            display["in_pantry"] = best["match_status"] not in {"missing", "insufficient"}
+            display["alternates"] = [
+                {
+                    "ingredient_id": member["ingredient_id"],
+                    "name": member["name"],
+                    "quantity": member["quantity"],
+                    "unit": member["unit"],
+                    "match_status": member["match_status"],
+                }
+                for member in members
+            ]
+            collapsed.append(display)
+        return collapsed
+
+    recipe.ingredients = collapse_or_groups(
+        [ingredient_match(item) for item in recipe.recipe_ingredients]
+    )
+    recipe.parse_warnings = list(recipe.parse_warnings or [])
     recipe.nutrition = {
         "calories": recipe.calories,
         "protein_g": recipe.protein_grams,

@@ -27,6 +27,9 @@ IGNORED_CANDIDATE_TOKENS = {
     "small",
     "the",
 }
+COLOR_WORDS = frozenset(
+    {"black", "brown", "green", "orange", "purple", "red", "white", "yellow"}
+)
 
 
 def normalize_ingredient_name(value: object) -> str:
@@ -62,8 +65,20 @@ async def _canonical_candidates(
     return candidates[:MAX_CANDIDATES]
 
 
-def _canonicalization_prompt(names: list[str], candidates: list[str]) -> str:
-    numbered = "\n".join(f"{index}. {name}" for index, name in enumerate(names, start=1))
+def _canonicalization_prompt(
+    names: list[str],
+    candidates: list[str],
+    *,
+    raw_hints: dict[str, str] | None = None,
+) -> str:
+    numbered_lines: list[str] = []
+    for index, name in enumerate(names, start=1):
+        hint = (raw_hints or {}).get(name)
+        if hint and hint != name:
+            numbered_lines.append(f"{index}. {name}\n   source: {hint}")
+        else:
+            numbered_lines.append(f"{index}. {name}")
+    numbered = "\n".join(numbered_lines)
     return (
         "Canonicalize each input for pantry-to-recipe ingredient matching.\n"
         "Return one JSON object whose keys are the exact inputs and whose values are canonical "
@@ -75,8 +90,11 @@ def _canonicalization_prompt(names: list[str], candidates: list[str]) -> str:
         "is not milk, almond butter is not butter, and garlic powder is not garlic.\n"
         "- Distinct oils, flours, dairy products, meats, and produce remain distinct unless one "
         "input is merely a variety or grade of the same ingredient.\n"
+        "- When a source line offers true substitutes (fresh tomatoes or canned tomatoes), "
+        "canonicalize the input name itself; do not invent a second option here.\n"
         "- Prefer an exact name from EXISTING CANONICALS when it applies. Otherwise return a "
         "short, lowercase ingredient noun phrase.\n"
+        "- Use the optional source line for context when the input name is truncated or messy.\n"
         "- Include every input exactly once. Return JSON only.\n\n"
         "Examples:\n"
         '{"coconut milk":"coconut milk","extra virgin olive oil":"olive oil",'
@@ -108,6 +126,137 @@ def _parse_mapping(raw: str, expected_names: list[str]) -> dict[str, str]:
             and "\n" not in canonical
         ):
             mapping[name] = canonical
+    return mapping
+
+
+def _or_alternates_prompt(lines: list[str], candidates: list[str]) -> str:
+    numbered = "\n".join(f"{index}. {line}" for index, line in enumerate(lines, start=1))
+    return (
+        "Each input is an ingredient line containing 'or'. Decide whether the options are "
+        "interchangeable varieties of one ingredient or true substitutes that should match "
+        "the pantry separately.\n"
+        "Return JSON object mapping each exact input string to a list of 1+ short lowercase "
+        "canonical ingredient names.\n\n"
+        "Rules:\n"
+        "- Color/size varieties of the same food → one name "
+        '(e.g. "red or green bell peppers" → ["bell peppers"]).\n'
+        "- True substitutes → multiple names "
+        '(e.g. "pancetta or prosciutto" → ["pancetta","prosciutto"]).\n'
+        "- Prefer EXISTING CANONICALS when applicable.\n"
+        "- Include every input exactly once. Return JSON only.\n\n"
+        f"EXISTING CANONICALS:\n{json.dumps(candidates, ensure_ascii=False)}\n\n"
+        f"INPUTS:\n{numbered}"
+    )
+
+
+def _parse_alternates_mapping(raw: str, expected_lines: list[str]) -> dict[str, list[str]]:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I)
+    value = json.loads(text)
+    if not isinstance(value, dict):
+        raise ValueError("OR alternate response must be a JSON object")
+    expected = set(expected_lines)
+    mapping: dict[str, list[str]] = {}
+    for raw_line, raw_names in value.items():
+        line = " ".join(str(raw_line or "").split())
+        if line not in expected:
+            continue
+        names: list[str] = []
+        if isinstance(raw_names, str):
+            raw_names = [raw_names]
+        if not isinstance(raw_names, list):
+            continue
+        for item in raw_names:
+            name = normalize_ingredient_name(item)
+            if name and len(name) <= MAX_CANONICAL_LENGTH and "\n" not in name:
+                if name not in names:
+                    names.append(name)
+        if names:
+            mapping[line] = names
+    return mapping
+
+
+def heuristic_or_alternates(raw_text: str, fallback_name: str) -> list[str]:
+    """Deterministic fallback when the LLM is unavailable."""
+    cleaned = " ".join(raw_text.split())
+    color_pattern = "|".join(sorted(COLOR_WORDS))
+    color_match = re.search(
+        rf"(?i)\b((?:{color_pattern})\s+or\s+(?:{color_pattern}))\s+(.+)$",
+        cleaned,
+    )
+    if color_match:
+        remainder = color_match.group(2).strip(" ,")
+        name = normalize_ingredient_name(
+            re.sub(
+                r"(?i)^(?:[\d/.\s]+(?:tablespoons?|tbsp|teaspoons?|tsp|cups?|ounces?|oz|"
+                r"pounds?|lbs?|grams?|g)\s+)?",
+                "",
+                remainder,
+            )
+        )
+        name = re.split(
+            r"\b(?:chopped|diced|minced|sliced|peeled|to taste)\b",
+            name,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" ,")
+        return [name or fallback_name]
+
+    parts = [
+        normalize_ingredient_name(part)
+        for part in re.split(r"\s+or\s+", fallback_name, flags=re.I)
+    ]
+    parts = [part for part in parts if part]
+    if len(parts) >= 2 and all(len(part.split()) <= 4 for part in parts):
+        return parts
+    return [fallback_name]
+
+
+async def resolve_or_alternates(
+    lines: list[str],
+    fallback_names: dict[str, str],
+    *,
+    db: AsyncSession | None = None,
+    timeout: float = 20.0,
+) -> dict[str, list[str]]:
+    """Map ambiguous OR raw lines to one or more canonical names."""
+    unique_lines = list(dict.fromkeys(" ".join(line.split()) for line in lines if line.strip()))
+    if not unique_lines:
+        return {}
+
+    if not settings.openai_api_key:
+        return {
+            line: heuristic_or_alternates(line, fallback_names.get(line, line))
+            for line in unique_lines
+        }
+
+    mapping: dict[str, list[str]] = {}
+    for offset in range(0, len(unique_lines), BATCH_SIZE):
+        batch = unique_lines[offset : offset + BATCH_SIZE]
+        try:
+            candidates: list[str] = []
+            if db is not None:
+                candidates = await _canonical_candidates(
+                    db,
+                    [fallback_names.get(line, line) for line in batch],
+                )
+            raw = await chat_completion(
+                system=(
+                    "You resolve grocery ingredient 'or' phrases conservatively for pantry "
+                    "matching. Prefer a single shared ingredient for color/size varieties."
+                ),
+                user=_or_alternates_prompt(batch, candidates),
+                temperature=0,
+                response_format={"type": "json_object"},
+                timeout=timeout,
+            )
+            mapping.update(_parse_alternates_mapping(raw, batch))
+        except Exception:
+            logger.exception("Failed to resolve OR alternates starting with %r", batch[0])
+        for line in batch:
+            if line not in mapping:
+                mapping[line] = heuristic_or_alternates(line, fallback_names.get(line, line))
     return mapping
 
 
@@ -153,6 +302,7 @@ async def canonicalize_ingredients(
     ingredients: list[Ingredient],
     *,
     timeout: float = 20.0,
+    raw_hints: dict[str, str] | None = None,
 ) -> None:
     """Resolve ingredients to stable canonical roots without failing the caller."""
     if not settings.openai_api_key:
@@ -174,7 +324,7 @@ async def canonicalize_ingredients(
                     "worse than missed matches. Never collapse a compound ingredient into a "
                     "different food."
                 ),
-                user=_canonicalization_prompt(names, candidates),
+                user=_canonicalization_prompt(names, candidates, raw_hints=raw_hints),
                 temperature=0,
                 response_format={"type": "json_object"},
                 timeout=timeout,
