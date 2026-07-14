@@ -1,0 +1,69 @@
+@import "tailwindcss";
+
+@theme {
+  --color-cream: #f8f5ed;
+  --color-sand: #eee9dc;
+  --color-line: #ddd7c9;
+  --color-ink: #25312c;
+  --color-muted: #68736d;
+  --color-sage: #6f806a;
+  --color-sage-dark: #43594d;
+  --color-leaf: #739c62;
+  --color-leaf-dark: #3f6c37;
+  --color-terracotta: #b65b3d;
+  --font-sans: "Avenir Next", Avenir, "Segoe UI", sans-serif;
+  --font-display: Georgia, "Times New Roman", serif;
+  --shadow-card: 0 1px 2px rgb(37 49 44 / .04), 0 8px 24px rgb(37 49 44 / .05);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--color-cream);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100dvh;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+.kitchen-pattern {
+  background-image:
+    radial-gradient(circle at 15% 20%, rgba(255, 255, 255, .5) 0 2px, transparent 2.5px),
+    radial-gradient(circle at 85% 70%, rgba(255, 255, 255, .35) 0 3px, transparent 3.5px),
+    linear-gradient(45deg, transparent 48%, rgba(255, 255, 255, .18) 49% 51%, transparent 52%);
+  background-size: 48px 48px, 76px 76px, 100px 100px;
+}
+
+::selection {
+  background: rgb(111 128 106 / .25);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: .01ms !important;
+    transition-duration: .01ms !important;
+  }
+}
