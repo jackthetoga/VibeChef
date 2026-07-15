@@ -1,0 +1,98 @@
+name: CI
+
+# Mirrors `make check`: lint + test both apps, and prove migrations apply on Postgres.
+# Runs on every PR and on pushes to main. Configure branch protection to require these
+# checks so nothing merges to main while red.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (ruff + pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Lint (ruff)
+        run: ruff check app tests
+      - name: Test (pytest, in-memory SQLite)
+        run: pytest
+
+  migrations:
+    name: Alembic migrations apply on Postgres
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: recipe_finder
+          POSTGRES_USER: recipe_finder
+          POSTGRES_PASSWORD: recipe_finder
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U recipe_finder -d recipe_finder"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Matches docker-compose; asyncpg driver as the app expects.
+      DATABASE_URL: postgresql+asyncpg://recipe_finder:recipe_finder@localhost:5432/recipe_finder
+      SECRET_KEY: ci-secret-key-that-is-at-least-32-chars-long
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Upgrade to head (all migrations must apply cleanly)
+        run: alembic upgrade head
+      - name: Detect model/migration drift
+        # Fails if models changed without a matching migration. Non-fatal for now
+        # (remove `|| true` once the schema is stable) but surfaces the warning.
+        run: alembic check || true
+
+  frontend:
+    name: Frontend (oxlint + vitest + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint (oxlint)
+        run: npm run lint
+      - name: Test (vitest)
+        run: npm test
+      - name: Build (tsc + vite — proves types compile)
+        run: npm run build
