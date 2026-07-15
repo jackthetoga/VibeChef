@@ -14,7 +14,10 @@ import type {
   PantryItem,
   PantryScanResult,
   Recipe,
+  RecipeCookItem,
+  RecipeCookResult,
   RecipeFilters,
+  RecipeTagUpdate,
   User,
 } from './types'
 
@@ -121,7 +124,14 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 function queryString(values: object) {
   const params = new URLSearchParams()
   Object.entries(values).forEach(([key, value]) => {
-    if (value !== undefined && value !== '') params.set(key, String(value))
+    if (value === undefined || value === '') return
+    if (Array.isArray(value)) {
+      value.forEach((item) => {
+        if (item !== undefined && item !== '') params.append(key, String(item))
+      })
+      return
+    }
+    params.set(key, String(value))
   })
   const query = params.toString()
   return query ? `?${query}` : ''
@@ -186,6 +196,16 @@ export const recipesApi = {
     return page(await request<CursorPage<Recipe> | Recipe[]>(`/recipes${queryString(filters)}`))
   },
   get: (id: string) => request<Recipe>(`/recipes/${encodeURIComponent(id)}`),
+  update: (id: string, input: RecipeTagUpdate) =>
+    request<Recipe>(`/recipes/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(input),
+    }),
+  cook: (id: string, items?: RecipeCookItem[]) =>
+    request<RecipeCookResult>(`/recipes/${encodeURIComponent(id)}/cook`, {
+      method: 'POST',
+      body: JSON.stringify(items === undefined ? {} : { items }),
+    }),
   async imageBlob(id: string) {
     const response = await fetch(`${API_BASE}/recipes/${encodeURIComponent(id)}/image`, {
       headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
@@ -225,8 +245,18 @@ export const pantryApi = {
     body.append('file', file)
     return request<PantryScanResult>('/pantry/scan', { method: 'POST', body })
   },
+  scanReceipt: (file: File) => {
+    const body = new FormData()
+    body.append('file', file)
+    return request<PantryScanResult>('/pantry/scan-receipt', { method: 'POST', body })
+  },
   confirm: (items: PantryConfirmItem[]) =>
     request<PantryConfirmResult>('/pantry/confirm', {
+      method: 'POST',
+      body: JSON.stringify({ items }),
+    }),
+  confirmReceipt: (items: PantryConfirmItem[]) =>
+    request<PantryConfirmResult>('/pantry/confirm-receipt', {
       method: 'POST',
       body: JSON.stringify({ items }),
     }),

@@ -24,12 +24,29 @@ from sqlalchemy.orm import aliased, selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.models import Cookbook, Ingredient, PantryItem, Recipe, RecipeIngredient
-from app.schemas.api import NutritionOut, RecipeListItem, RecipeOut, RecipePage
+from app.schemas.api import (
+    NutritionOut,
+    RecipeCookCreate,
+    RecipeCookOut,
+    RecipeListItem,
+    RecipeOut,
+    RecipePage,
+    RecipeUpdate,
+)
+from app.services.pantry_text import apply_quantity_delta
+from app.services.recipe_filters import (
+    food_group_tag_candidates,
+    normalize_category,
+    tags_contain,
+    tags_contain_any,
+)
 from app.services.recipe_images import (
     recipe_image_media_type,
     recipe_image_url,
     resolve_recipe_image_file,
 )
+from app.services.recipe_tagging import apply_manual_tags
+from app.services.derivatives import parent_name_candidates
 from app.services.units import (
     compare_quantities,
     ingredient_conversion_for_units,
@@ -65,7 +82,15 @@ def nutrition_out(recipe: Recipe) -> NutritionOut | None:
     )
 
 
-SortField = Literal["total_time", "calories", "protein", "missing_count", "created_at", "title"]
+SortField = Literal[
+    "total_time",
+    "calories",
+    "protein",
+    "missing_count",
+    "created_at",
+    "title",
+    "rating",
+]
 SortOrder = Literal["asc", "desc"]
 
 
@@ -120,14 +145,46 @@ def missing_count_expression(user_id: uuid.UUID):
     """Count unsatisfied ingredient groups (OR alternates use ANY matching)."""
     pantry_ingredient = aliased(Ingredient)
     group_key = func.coalesce(RecipeIngredient.alternate_group_id, RecipeIngredient.id)
+    recipe_name = func.lower(func.trim(Ingredient.name))
+    pantry_name = func.lower(func.trim(pantry_ingredient.name))
+    # Portable parent extraction for "... zest/peel/rind/juice"
+    parent_name = func.trim(
+        func.replace(
+            func.replace(
+                func.replace(
+                    func.replace(recipe_name, " zest", ""),
+                    " peel",
+                    "",
+                ),
+                " rind",
+                "",
+            ),
+            " juice",
+            "",
+        )
+    )
+    same_canonical = (
+        func.coalesce(pantry_ingredient.canonical_id, pantry_ingredient.id)
+        == func.coalesce(Ingredient.canonical_id, Ingredient.id)
+    )
+    derivative_parent_match = and_(
+        recipe_name != parent_name,
+        or_(
+            pantry_name == parent_name,
+            pantry_name == parent_name + "s",
+            and_(
+                func.length(parent_name) > 1,
+                pantry_name == func.substr(parent_name, 1, func.length(parent_name) - 1),
+            ),
+        ),
+    )
     in_pantry = exists(
         select(literal(1))
         .select_from(PantryItem)
         .join(pantry_ingredient, pantry_ingredient.id == PantryItem.ingredient_id)
         .where(
             PantryItem.user_id == user_id,
-            func.coalesce(pantry_ingredient.canonical_id, pantry_ingredient.id)
-            == func.coalesce(Ingredient.canonical_id, Ingredient.id),
+            or_(same_canonical, derivative_parent_match),
             pantry_quantity_match_expression(Ingredient.name),
         )
     )
@@ -175,7 +232,7 @@ def decode_cursor(cursor: str, sort: SortField) -> tuple[object, uuid.UUID]:
         value: object = payload["v"]
         if sort == "created_at":
             value = datetime.fromisoformat(str(value))
-        elif sort in {"total_time", "calories", "protein"}:
+        elif sort in {"total_time", "calories", "protein", "rating"}:
             value = Decimal(str(value))
         elif sort == "missing_count":
             value = int(value)
@@ -196,6 +253,9 @@ async def list_recipes(
     min_protein: Decimal | None = Query(default=None, ge=0),
     max_missing: int | None = Query(default=None, ge=0),
     cuisine: str | None = Query(default=None, max_length=120),
+    category: str | None = Query(default=None, max_length=80),
+    food_group: str | None = Query(default=None, max_length=80),
+    tag: list[str] | None = Query(default=None, max_length=80),
     cookbook_id: uuid.UUID | None = None,
     makeable: bool | None = None,
     cursor: str | None = None,
@@ -210,10 +270,12 @@ async def list_recipes(
         "missing_count",
         "created_at",
         "title",
+        "rating",
     }:
         raise HTTPException(status_code=422, detail="Unsupported recipe sort")
     missing = missing_count_expression(user.id)
     null_number = 1_000_000_000 if order == "asc" else -1
+    rating_null = Decimal("-1") if order == "desc" else Decimal("1000000")
     sort_expressions = {
         "total_time": func.coalesce(Recipe.total_minutes, null_number),
         "calories": func.coalesce(Recipe.calories, null_number),
@@ -221,6 +283,7 @@ async def list_recipes(
         "missing_count": cast(missing, Integer),
         "created_at": Recipe.created_at,
         "title": func.lower(Recipe.title),
+        "rating": func.coalesce(Recipe.rating, rating_null),
     }
     sort_expr = sort_expressions[canonical_sort]
     statement = (
@@ -264,8 +327,21 @@ async def list_recipes(
         statement = statement.where(missing <= max_missing)
     if makeable:
         statement = statement.where(missing <= 0)
+    # Cuisine is exclusive: a single value only (not combinable with other cuisines).
     if cuisine:
         statement = statement.where(func.lower(Recipe.cuisine) == cuisine.strip().lower())
+    if category:
+        category_clause = tags_contain(normalize_category(category))
+        statement = statement.where(category_clause)
+    if food_group:
+        group_clause = tags_contain_any(food_group_tag_candidates(food_group))
+        if group_clause is not None:
+            statement = statement.where(group_clause)
+    # Extra tags stack (AND). Useful for dish styles that are not cuisine.
+    for raw_tag in tag or []:
+        cleaned = raw_tag.strip().lower()
+        if cleaned:
+            statement = statement.where(tags_contain(cleaned))
     if cookbook_id:
         statement = statement.where(Recipe.cookbook_id == cookbook_id)
 
@@ -296,7 +372,10 @@ async def list_recipes(
             calories=recipe.calories,
             protein_grams=recipe.protein_grams,
             cuisine=recipe.cuisine,
+            rating=recipe.rating,
+            rating_count=recipe.rating_count,
             tags=recipe.tags,
+            tag_source=recipe.tag_source,
             created_at=recipe.created_at,
             missing_count=int(missing_value or 0),
             image_url=recipe_image_url(recipe.id, recipe.image_path),
@@ -315,6 +394,43 @@ async def list_recipes(
         last_recipe, _, last_sort_value, _ = rows[-1]
         next_cursor = encode_cursor(last_sort_value, last_recipe.id)
     return RecipePage(items=items, next_cursor=next_cursor)
+
+
+@router.patch("/{recipe_id}", response_model=RecipeOut)
+async def update_recipe(
+    recipe_id: uuid.UUID,
+    body: RecipeUpdate,
+    db: DB,
+    user: CurrentUser,
+) -> Recipe:
+    recipe = (
+        await db.execute(
+            select(Recipe)
+            .join(Cookbook, Cookbook.id == Recipe.cookbook_id)
+            .where(Recipe.id == recipe_id, Cookbook.user_id == user.id)
+        )
+    ).scalar_one_or_none()
+    if recipe is None:
+        raise HTTPException(status_code=404, detail="Recipe not found")
+
+    fields = body.model_fields_set
+    assignment = apply_manual_tags(
+        existing_tags=list(recipe.tags or []),
+        existing_cuisine=recipe.cuisine,
+        cuisine=body.cuisine,
+        update_cuisine="cuisine" in fields,
+        category=body.category,
+        update_category="category" in fields,
+        food_groups=body.food_groups if "food_groups" in fields else None,
+        dish_tags=body.dish_tags if "dish_tags" in fields else None,
+        tags=body.tags if "tags" in fields else None,
+    )
+    recipe.cuisine = assignment.cuisine
+    recipe.tags = assignment.tags
+    recipe.tag_source = "manual"
+    await db.commit()
+
+    return await get_recipe(recipe_id, db, user)
 
 
 @router.get("/{recipe_id}", response_model=RecipeOut)
@@ -350,15 +466,34 @@ async def get_recipe(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> Recipe:
             .where(PantryItem.user_id == user.id)
         )
     }
+    pantry_by_name = {
+        " ".join(item.ingredient.name.lower().split()): item
+        for item in pantry_items.values()
+    }
 
-    def ingredient_match(item: RecipeIngredient) -> dict[str, object]:
+    def resolve_pantry_item(item: RecipeIngredient):
         match_key = item.ingredient.canonical_id or item.ingredient_id
         pantry_item = pantry_items.get(match_key)
+        if pantry_item is not None:
+            return pantry_item, None
+        for candidate in parent_name_candidates(item.ingredient.name):
+            pantry_item = pantry_by_name.get(candidate)
+            if pantry_item is not None:
+                return pantry_item, pantry_item.ingredient.name
+            for pantry_candidate in pantry_items.values():
+                pantry_name = " ".join(pantry_candidate.ingredient.name.lower().split())
+                if pantry_name == candidate or pantry_name.rstrip("s") == candidate.rstrip("s"):
+                    return pantry_candidate, pantry_candidate.ingredient.name
+        return None, None
+
+    def ingredient_match(item: RecipeIngredient) -> dict[str, object]:
+        pantry_item, matched_via_parent = resolve_pantry_item(item)
+        conversion_name = matched_via_parent or item.ingredient.name
         conversion_profile = (
             ingredient_conversion_for_units(
                 pantry_item.unit,
                 item.unit,
-                item.ingredient.name,
+                conversion_name,
             )
             if pantry_item
             else None
@@ -373,14 +508,31 @@ async def get_recipe(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> Recipe:
                 pantry_item.unit,
                 item.quantity,
                 item.unit,
-                item.ingredient.name,
+                conversion_name,
             )
             if comparison is True:
                 match_status = "available"
             elif comparison is False:
-                match_status = "insufficient"
+                # Derivatives (zest/juice) from a whole food: any positive parent counts.
+                if matched_via_parent and (
+                    pantry_item.quantity is None or pantry_item.quantity > 0
+                ):
+                    match_status = "available"
+                else:
+                    match_status = "insufficient"
             else:
-                match_status = "unknown"
+                # Unknown unit pairing for a derivative → treat as available if parent is on hand.
+                if matched_via_parent:
+                    match_status = "available"
+                else:
+                    match_status = "unknown"
+        matched_via = matched_via_parent
+        if (
+            matched_via is None
+            and pantry_item is not None
+            and pantry_item.ingredient.name != item.ingredient.name
+        ):
+            matched_via = pantry_item.ingredient.name
         return {
             "id": item.id,
             "ingredient_id": item.ingredient_id,
@@ -395,12 +547,7 @@ async def get_recipe(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> Recipe:
             "match_status": match_status,
             "pantry_quantity": pantry_item.quantity if pantry_item else None,
             "pantry_unit": pantry_item.unit if pantry_item else None,
-            "matched_via": (
-                pantry_item.ingredient.name
-                if pantry_item
-                and pantry_item.ingredient.name != item.ingredient.name
-                else None
-            ),
+            "matched_via": matched_via,
             "conversion_basis": conversion_profile.basis if conversion_profile else None,
             "conversion_source": conversion_profile.source_url if conversion_profile else None,
             "alternates": None,
@@ -457,6 +604,157 @@ async def get_recipe(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> Recipe:
     recipe.parse_warnings = list(recipe.parse_warnings or [])
     recipe.nutrition = nutrition_out(recipe)
     return recipe
+
+
+def _default_cook_ingredients(
+    recipe_ingredients: list[RecipeIngredient],
+    pantry_by_canonical: dict[object, PantryItem],
+) -> list[tuple[RecipeIngredient, Decimal | None, str | None]]:
+    """Pick one ingredient per OR-group (prefer pantry match) and skip staples."""
+    groups: dict[object, list[RecipeIngredient]] = {}
+    order: list[object] = []
+    for item in recipe_ingredients:
+        key = item.alternate_group_id or item.id
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(item)
+
+    selected: list[tuple[RecipeIngredient, Decimal | None, str | None]] = []
+    for key in order:
+        members = groups[key]
+        non_staples = [member for member in members if not member.ingredient.staple]
+        candidates = non_staples or members
+        if all(member.ingredient.staple for member in candidates):
+            continue
+
+        def rank(member: RecipeIngredient) -> tuple[int, int]:
+            match_key = member.ingredient.canonical_id or member.ingredient_id
+            pantry_item = pantry_by_canonical.get(match_key)
+            if pantry_item is None:
+                return (2, 0)
+            comparison = compare_quantities(
+                pantry_item.quantity,
+                pantry_item.unit,
+                member.quantity,
+                member.unit,
+                member.ingredient.name,
+            )
+            if comparison is True:
+                return (0, 0)
+            if comparison is False:
+                return (1, 0)
+            return (1, 1)
+
+        best = min(candidates, key=rank)
+        if best.ingredient.staple:
+            continue
+        selected.append((best, best.quantity, best.unit))
+    return selected
+
+
+@router.post("/{recipe_id}/cook", response_model=RecipeCookOut)
+async def cook_recipe(
+    recipe_id: uuid.UUID,
+    body: RecipeCookCreate,
+    db: DB,
+    user: CurrentUser,
+) -> RecipeCookOut:
+    recipe = (
+        await db.execute(
+            select(Recipe)
+            .join(Cookbook, Cookbook.id == Recipe.cookbook_id)
+            .options(
+                selectinload(Recipe.recipe_ingredients).selectinload(RecipeIngredient.ingredient)
+            )
+            .where(Recipe.id == recipe_id, Cookbook.user_id == user.id)
+        )
+    ).scalar_one_or_none()
+    if recipe is None:
+        raise HTTPException(status_code=404, detail="Recipe not found")
+
+    pantry_items = list(
+        await db.scalars(
+            select(PantryItem)
+            .options(selectinload(PantryItem.ingredient))
+            .where(PantryItem.user_id == user.id)
+        )
+    )
+    pantry_by_canonical: dict[object, PantryItem] = {}
+    pantry_by_ingredient_id: dict[uuid.UUID, PantryItem] = {}
+    for item in pantry_items:
+        pantry_by_ingredient_id[item.ingredient_id] = item
+        key = item.ingredient.canonical_id or item.ingredient_id
+        pantry_by_canonical[key] = item
+
+    recipe_by_id = {item.ingredient_id: item for item in recipe.recipe_ingredients}
+
+    if body.items is None:
+        deductions = _default_cook_ingredients(recipe.recipe_ingredients, pantry_by_canonical)
+    else:
+        if not body.items:
+            raise HTTPException(
+                status_code=422,
+                detail="Select at least one ingredient to subtract from your fridge",
+            )
+        deductions = []
+        for entry in body.items:
+            recipe_item = recipe_by_id.get(entry.ingredient_id)
+            if recipe_item is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Ingredient {entry.ingredient_id} is not part of this recipe",
+                )
+            quantity = entry.quantity if entry.quantity is not None else recipe_item.quantity
+            unit = entry.unit if entry.unit is not None else recipe_item.unit
+            deductions.append((recipe_item, quantity, unit))
+
+    updated: list[PantryItem] = []
+    removed: list[str] = []
+    skipped: list[str] = []
+    touched: set[uuid.UUID] = set()
+
+    for recipe_item, quantity, unit in deductions:
+        match_key = recipe_item.ingredient.canonical_id or recipe_item.ingredient_id
+        pantry_item = pantry_by_canonical.get(match_key)
+        if pantry_item is None:
+            pantry_item = pantry_by_ingredient_id.get(recipe_item.ingredient_id)
+        if pantry_item is None:
+            skipped.append(recipe_item.ingredient.name)
+            continue
+        if pantry_item.id in touched:
+            continue
+
+        new_quantity, new_unit, remove_item = apply_quantity_delta(
+            pantry_item.quantity,
+            pantry_item.unit,
+            quantity,
+            unit,
+            sign=-1,
+        )
+        name = (
+            pantry_item.ingredient.name
+            if pantry_item.ingredient is not None
+            else recipe_item.ingredient.name
+        )
+        if remove_item:
+            removed.append(name)
+            pantry_by_canonical.pop(match_key, None)
+            pantry_by_ingredient_id.pop(pantry_item.ingredient_id, None)
+            await db.delete(pantry_item)
+            touched.add(pantry_item.id)
+            continue
+
+        pantry_item.quantity = new_quantity
+        pantry_item.unit = new_unit
+        updated.append(pantry_item)
+        touched.add(pantry_item.id)
+
+    await db.commit()
+    for item in updated:
+        await db.refresh(item, attribute_names=["ingredient"])
+
+    return RecipeCookOut(updated=updated, removed=removed, skipped=skipped)
 
 
 @router.get("/{recipe_id}/image")

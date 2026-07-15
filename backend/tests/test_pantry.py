@@ -284,6 +284,86 @@ async def test_pantry_scan_returns_demo_items_without_api_key(
 
 
 @pytest.mark.asyncio
+async def test_pantry_scan_receipt_rejects_non_images(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "openai_api_key", "")
+    headers = await auth_headers(client)
+    response = await client.post(
+        "/api/v1/pantry/scan-receipt",
+        headers=headers,
+        files={"file": ("notes.txt", b"not an image", "text/plain")},
+    )
+    assert response.status_code == 415
+
+
+@pytest.mark.asyncio
+async def test_pantry_scan_receipt_returns_demo_items_without_api_key(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "openai_api_key", "")
+    headers = await auth_headers(client)
+    jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+    response = await client.post(
+        "/api/v1/pantry/scan-receipt",
+        headers=headers,
+        files={"file": ("receipt.jpg", jpeg, "image/jpeg")},
+    )
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert len(items) >= 1
+    assert {item["name"] for item in items} >= {"milk", "eggs", "bread"}
+    milk = next(item for item in items if item["name"] == "milk")
+    assert Decimal(str(milk["quantity"])) == Decimal("1")
+    assert milk["unit"] == "l"
+
+
+@pytest.mark.asyncio
+async def test_pantry_confirm_receipt_adds_quantities(client: AsyncClient) -> None:
+    headers = await auth_headers(client)
+
+    seeded = await client.post(
+        "/api/v1/pantry/confirm",
+        headers=headers,
+        json={
+            "items": [
+                {"ingredient_name": "milk", "quantity": 1, "unit": "l"},
+                {"ingredient_name": "eggs", "quantity": 6, "unit": "pieces"},
+            ]
+        },
+    )
+    assert seeded.status_code == 200
+
+    confirmed = await client.post(
+        "/api/v1/pantry/confirm-receipt",
+        headers=headers,
+        json={
+            "items": [
+                {"ingredient_name": "milk", "quantity": 2, "unit": "l"},
+                {"ingredient_name": "bread", "quantity": 1, "unit": "loaf"},
+            ]
+        },
+    )
+    assert confirmed.status_code == 200
+    body = confirmed.json()
+    assert [item["ingredient"]["name"] for item in body["added"]] == ["bread"]
+    assert [item["ingredient"]["name"] for item in body["updated"]] == ["milk"]
+    assert Decimal(body["updated"][0]["quantity"]) == Decimal("3")
+
+    pantry = await client.get("/api/v1/pantry", headers=headers)
+    by_name = {item["ingredient"]["name"]: item for item in pantry.json()}
+    assert set(by_name) == {"milk", "eggs", "bread"}
+    assert Decimal(by_name["milk"]["quantity"]) == Decimal("3")
+    assert Decimal(by_name["eggs"]["quantity"]) == Decimal("6")
+    assert Decimal(by_name["bread"]["quantity"]) == Decimal("1")
+    assert by_name["bread"]["unit"] == "loaf"
+
+
+@pytest.mark.asyncio
 async def test_autocomplete_returns_ranked_canonical_roots_only(
     client: AsyncClient,
 ) -> None:

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy import and_, case, func
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.sql.elements import ColumnElement
 
 from app.services.ingredient_conversions import (
@@ -69,6 +69,16 @@ def compare_quantities(
 
     available_name = normalize_unit(available_unit)
     required_name = normalize_unit(required_unit)
+    profile = get_ingredient_conversion(ingredient_name)
+
+    # "1 carrot" (unitless) vs "0.7 lbs carrots" — treat missing unit as count
+    # when we know a typical item weight.
+    if profile is not None and profile.grams_per_item is not None:
+        if available_name is None and required_name is not None:
+            available_name = "piece"
+        if required_name is None and available_name is not None:
+            required_name = "piece"
+
     if available_name == required_name:
         return available_quantity >= required_quantity
     if not available_name or not required_name:
@@ -81,7 +91,6 @@ def compare_quantities(
     if available.dimension == required.dimension:
         return available_quantity * available.factor >= required_quantity * required.factor
 
-    profile = get_ingredient_conversion(ingredient_name)
     if not profile:
         return None
     available_grams = quantity_in_grams(available_quantity, available, profile)
@@ -112,9 +121,16 @@ def ingredient_conversion_for_units(
     required_unit: str | None,
     ingredient_name: str | None,
 ) -> IngredientConversion | None:
-    available = UNIT_DEFINITIONS.get(normalize_unit(available_unit) or "")
-    required = UNIT_DEFINITIONS.get(normalize_unit(required_unit) or "")
+    available_name = normalize_unit(available_unit)
+    required_name = normalize_unit(required_unit)
     profile = get_ingredient_conversion(ingredient_name)
+    if profile is not None and profile.grams_per_item is not None:
+        if available_name is None and required_name is not None:
+            available_name = "piece"
+        if required_name is None and available_name is not None:
+            required_name = "piece"
+    available = UNIT_DEFINITIONS.get(available_name or "")
+    required = UNIT_DEFINITIONS.get(required_name or "")
     if not available or not required or not profile or available.dimension == required.dimension:
         return None
     if (
@@ -181,8 +197,10 @@ def ingredient_unit_grams_expression(
             clove_cases.append((normalized_name.in_(names), profile.grams_per_clove))
     item_grams = case(*item_cases, else_=None)
     clove_grams = case(*clove_cases, else_=None)
+    # Unitless recipe lines ("1 carrot") count as pieces when item weight is known.
+    count_like = or_(unit_dimension == "count", unit.is_(None))
     return case(
-        (unit_dimension == "count", item_grams),
+        (count_like, item_grams),
         (unit_dimension == "clove", clove_grams),
         else_=None,
     )

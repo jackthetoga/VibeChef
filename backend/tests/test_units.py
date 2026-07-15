@@ -76,6 +76,32 @@ def test_ingredient_piece_weights_convert_count_to_mass() -> None:
     )
 
 
+def test_unitless_count_converts_to_mass_using_item_weight() -> None:
+    """Recipe '1 carrot' (no unit) should be satisfied by ~0.7 lb carrots in pantry."""
+    assert compare_quantities(
+        Decimal("0.7"),
+        "lbs",
+        Decimal("1"),
+        None,
+        "carrot",
+    )
+    assert compare_quantities(
+        Decimal("0.7"),
+        "lb",
+        Decimal("1"),
+        None,
+        "carrots",
+    )
+    # Far too little mass for even one carrot (~61g).
+    assert not compare_quantities(
+        Decimal("0.05"),
+        "lb",
+        Decimal("1"),
+        None,
+        "carrot",
+    )
+
+
 def test_all_common_ingredients_have_sourced_conversion_profiles() -> None:
     common_names = {item.name for item in COMMON_INGREDIENTS}
     profile_names = {profile.name for profile in INGREDIENT_CONVERSIONS}

@@ -265,6 +265,10 @@ class PantryConfirmCreate(BaseModel):
     items: list[PantryConfirmItem] = Field(min_length=1, max_length=50)
 
 
+class PantryConfirmReceiptCreate(BaseModel):
+    items: list[PantryConfirmItem] = Field(min_length=1, max_length=80)
+
+
 class PantryConfirmOut(BaseModel):
     added: list[PantryOut]
     updated: list[PantryOut]
@@ -326,7 +330,10 @@ class RecipeOut(ORMModel):
     carbs_grams: Decimal | None
     fat_grams: Decimal | None
     cuisine: str | None
+    rating: Decimal | None = None
+    rating_count: int | None = None
     tags: list[str]
+    tag_source: str | None = None
     steps: list[str]
     source_page: int | None
     created_at: datetime
@@ -353,7 +360,10 @@ class RecipeListItem(ORMModel):
     calories: Decimal | None
     protein_grams: Decimal | None
     cuisine: str | None
+    rating: Decimal | None = None
+    rating_count: int | None = None
     tags: list[str]
+    tag_source: str | None = None
     created_at: datetime
     missing_count: int
     image_url: str | None = None
@@ -369,3 +379,54 @@ class RecipeListItem(ORMModel):
 class RecipePage(BaseModel):
     items: list[RecipeListItem]
     next_cursor: str | None
+
+
+class RecipeUpdate(BaseModel):
+    """Manual tag overrides. Omitted fields are left unchanged; null clears cuisine."""
+
+    cuisine: str | None = Field(default=None, max_length=120)
+    category: str | None = Field(default=None, max_length=80)
+    food_groups: list[str] | None = Field(default=None, max_length=10)
+    dish_tags: list[str] | None = Field(default=None, max_length=20)
+    tags: list[str] | None = Field(default=None, max_length=40)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def require_at_least_one_field(self) -> "RecipeUpdate":
+        provided = self.model_fields_set
+        if not provided:
+            raise ValueError("Provide at least one field to update")
+        return self
+
+
+class RecipeCookItem(BaseModel):
+    ingredient_id: UUID
+    quantity: Decimal | None = Field(default=None, ge=0)
+    unit: str | None = Field(default=None, max_length=80)
+
+    @field_validator("unit")
+    @classmethod
+    def normalize_unit(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = " ".join(value.lower().split())
+        return cleaned or None
+
+
+class RecipeCookCreate(BaseModel):
+    """Subtract recipe ingredients from the pantry after cooking.
+
+    When ``items`` is omitted, every non-staple recipe ingredient is deducted
+    using the recipe's default quantities (skip-review path). When provided,
+    only the listed ingredients are deducted — quantity/unit overrides apply
+    when set; otherwise the recipe defaults are used.
+    """
+
+    items: list[RecipeCookItem] | None = Field(default=None, max_length=100)
+
+
+class RecipeCookOut(BaseModel):
+    updated: list[PantryOut]
+    removed: list[str]
+    skipped: list[str]

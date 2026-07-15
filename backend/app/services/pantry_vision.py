@@ -58,6 +58,16 @@ def demo_scan_items() -> list[ScannedGrocery]:
     ]
 
 
+def demo_receipt_items() -> list[ScannedGrocery]:
+    """Deterministic demo receipt line items when no API key is configured."""
+    return [
+        ScannedGrocery(name="milk", quantity=Decimal("1"), unit="l", confidence=0.9),
+        ScannedGrocery(name="eggs", quantity=Decimal("12"), unit="pieces", confidence=0.88),
+        ScannedGrocery(name="bread", quantity=Decimal("1"), unit="loaf", confidence=0.82),
+        ScannedGrocery(name="bananas", quantity=Decimal("6"), unit="pieces", confidence=0.75),
+    ]
+
+
 def sniff_image_media_type(content: bytes, content_type: str | None, filename: str) -> str:
     declared = (content_type or "").split(";")[0].strip().lower()
     if declared in ALLOWED_IMAGE_TYPES:
@@ -101,6 +111,48 @@ def _coerce_items(payload: object) -> list[ScannedGrocery]:
     return unique
 
 
+async def _scan_image_with_prompt(
+    *,
+    content: bytes,
+    media_type: str,
+    prompt: str,
+    system: str,
+    log_label: str,
+) -> list[ScannedGrocery]:
+    data_url = f"data:{media_type};base64,{base64.b64encode(content).decode('ascii')}"
+    user_content = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ]
+    validation_error = ""
+    for attempt in range(2):
+        messages_user = user_content
+        if validation_error:
+            messages_user = [
+                {"type": "text", "text": f"{prompt}\n\nPrevious output was invalid: {validation_error}"},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]
+        try:
+            raw = await chat_completion(
+                system=system,
+                user=messages_user,
+                temperature=0,
+                max_tokens=2048,
+                response_format={"type": "json_object"},
+                timeout=90.0,
+            )
+            return _coerce_items(_parse_json_payload(raw))
+        except (ValidationError, json.JSONDecodeError, InvalidOperation, KeyError, TypeError) as exc:
+            validation_error = str(exc)
+            if attempt:
+                logger.exception("Failed to parse %s scan response", log_label)
+                raise
+        except Exception:
+            logger.exception("%s vision request failed", log_label.capitalize())
+            raise
+    return []
+
+
 async def scan_groceries_from_image(
     *,
     content: bytes,
@@ -123,48 +175,51 @@ async def scan_groceries_from_image(
         "- confidence is 0-1 for how sure you are the item is present.\n"
         "- Never invent items that are not visible."
     )
-    data_url = f"data:{media_type};base64,{base64.b64encode(content).decode('ascii')}"
-    user_content = [
-        {"type": "text", "text": prompt},
-        {"type": "image_url", "image_url": {"url": data_url}},
-    ]
     system = (
         "You extract grocery items from photos for a pantry app. "
         "Return strict JSON only. Never invent values."
     )
-    validation_error = ""
-    for attempt in range(2):
-        messages_user = user_content
-        if validation_error:
-            messages_user = [
-                {
-                    "type": "text",
-                    "text": f"{prompt}\n\nPrevious output was invalid: {validation_error}",
-                },
-                {"type": "image_url", "image_url": {"url": data_url}},
-            ]
-        try:
-            raw = await chat_completion(
-                system=system,
-                user=messages_user,
-                temperature=0,
-                max_tokens=2048,
-                response_format={"type": "json_object"},
-                timeout=90.0,
-            )
-            return _coerce_items(_parse_json_payload(raw))
-        except (
-            ValidationError,
-            json.JSONDecodeError,
-            InvalidOperation,
-            KeyError,
-            TypeError,
-        ) as exc:
-            validation_error = str(exc)
-            if attempt:
-                logger.exception("Failed to parse grocery scan response")
-                raise
-        except Exception:
-            logger.exception("Grocery vision request failed")
-            raise
-    return []
+    return await _scan_image_with_prompt(
+        content=content,
+        media_type=media_type,
+        prompt=prompt,
+        system=system,
+        log_label="grocery",
+    )
+
+
+async def scan_receipt_from_image(
+    *,
+    content: bytes,
+    media_type: str,
+) -> list[ScannedGrocery]:
+    if not settings.openai_api_key:
+        return demo_receipt_items()
+
+    schema = json.dumps(ScannedGroceryEnvelope.model_json_schema())
+    prompt = (
+        "Parse grocery line items from this store receipt photo for a home pantry app.\n"
+        "Return JSON only matching this schema:\n"
+        f"{schema}\n\n"
+        "Rules:\n"
+        "- Read printed receipt line items only (not fridge contents or surrounding objects).\n"
+        "- Map branded SKUs to short lowercase pantry names "
+        "(e.g. \"horizon organic whole milk\" → \"milk\").\n"
+        "- Prefer pack quantity when printed (e.g. \"2 × eggs\" → quantity 2, unit \"pieces\");\n"
+        "  otherwise set quantity and unit to null.\n"
+        "- Prefer common cooking units (g, kg, ml, l, cup, tbsp, pieces, bunch, loaf).\n"
+        "- Skip tax, fees, bags, coupons, deposits, and non-food lines.\n"
+        "- confidence is 0-1 for how sure you are the line is a food item.\n"
+        "- Never invent lines that are not on the receipt."
+    )
+    system = (
+        "You extract food line items from grocery receipt photos for a pantry app. "
+        "Return strict JSON only. Never invent values."
+    )
+    return await _scan_image_with_prompt(
+        content=content,
+        media_type=media_type,
+        prompt=prompt,
+        system=system,
+        log_label="receipt",
+    )

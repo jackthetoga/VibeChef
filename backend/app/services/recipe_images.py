@@ -1,12 +1,14 @@
-"""Recipe imagery: category classification, asset paths, and book extraction."""
+"""Recipe imagery: cookbook extraction and photorealistic corpus matching."""
 
 from __future__ import annotations
 
+import json
 import logging
 import mimetypes
 import re
 import uuid
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -17,259 +19,35 @@ from app.models import ImageSource
 
 logger = logging.getLogger(__name__)
 
-CATEGORY_DIR = Path(__file__).resolve().parent.parent / "assets" / "recipe_categories"
+PHOTOS_DIR = Path(__file__).resolve().parent.parent / "assets" / "recipe_photos"
+MANIFEST_PATH = PHOTOS_DIR / "manifest.json"
 MIN_EXTRACTED_BYTES = 2_500
 MIN_IMAGE_DIMENSION = 80
-
-CATEGORY_SLUGS = (
-    "pasta",
-    "soup",
-    "salad",
-    "seafood",
-    "meat",
-    "poultry",
-    "vegetable",
-    "dessert",
-    "bread",
-    "sauce",
-    "breakfast",
-    "grain",
-    "stew",
-    "drink",
-    "other",
-)
-
-# Ordered rules: first match wins. Patterns match title, cuisine, and tags.
-_CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (
-        "soup",
-        (
-            r"\bsoup\b",
-            r"\bbroth\b",
-            r"\bbisque\b",
-            r"\bchowder\b",
-            r"\bconsomme\b",
-            r"\bconsommé\b",
-            r"\bpho\b",
-            r"\bmiso\b",
-        ),
-    ),
-    (
-        "stew",
-        (
-            r"\bstew\b",
-            r"\bcasserole\b",
-            r"\brajout\b",
-            r"\bgoulash\b",
-            r"\bcurry\b",
-            r"\bchili\b",
-            r"\bchilli\b",
-            r"\btagine\b",
-            r"\bbraise",
-        ),
-    ),
-    (
-        "pasta",
-        (
-            r"\bpasta\b",
-            r"\bspaghetti\b",
-            r"\blinguine\b",
-            r"\bfettuccine\b",
-            r"\bpenne\b",
-            r"\brigatoni\b",
-            r"\blasagna\b",
-            r"\blasagne\b",
-            r"\bnoodle\b",
-            r"\bramen\b",
-            r"\budon\b",
-            r"\bmacaroni\b",
-            r"\bgnocchi\b",
-        ),
-    ),
-    (
-        "salad",
-        (r"\bsalad\b", r"\bslaw\b", r"\bceviche\b"),
-    ),
-    (
-        "seafood",
-        (
-            r"\bfish\b",
-            r"\bsalmon\b",
-            r"\btuna\b",
-            r"\bcod\b",
-            r"\bshrimp\b",
-            r"\bprawn\b",
-            r"\bcrab\b",
-            r"\blobster\b",
-            r"\bmussel\b",
-            r"\bclam\b",
-            r"\boyster\b",
-            r"\bscallop\b",
-            r"\bsquid\b",
-            r"\bcalamari\b",
-            r"\bseafood\b",
-            r"\banchov",
-        ),
-    ),
-    (
-        "poultry",
-        (
-            r"\bchicken\b",
-            r"\bturkey\b",
-            r"\bduck\b",
-            r"\bhen\b",
-            r"\bpoultry\b",
-            r"\bquail\b",
-        ),
-    ),
-    (
-        "meat",
-        (
-            r"\bbeef\b",
-            r"\bsteak\b",
-            r"\bpork\b",
-            r"\blamb\b",
-            r"\bveal\b",
-            r"\bbacon\b",
-            r"\bsausage\b",
-            r"\bham\b",
-            r"\bribs?\b",
-            r"\bbrisket\b",
-            r"\bmeatball",
-            r"\bburger\b",
-        ),
-    ),
-    (
-        "dessert",
-        (
-            r"\bcake\b",
-            r"\bcookie\b",
-            r"\bbrownie\b",
-            r"\bpie\b",
-            r"\btart\b",
-            r"\bpudding\b",
-            r"\bicecream\b",
-            r"\bice cream\b",
-            r"\bchocolate\b",
-            r"\bdessert\b",
-            r"\bcustard\b",
-            r"\bsorbet\b",
-            r"\bmousse\b",
-            r"\bbiscotti\b",
-            r"\bcookies?\b",
-            r"\bsweet\b",
-        ),
-    ),
-    (
-        "bread",
-        (
-            r"\bbread\b",
-            r"\bbaguette\b",
-            r"\bbiscuit\b",
-            r"\bmuffin\b",
-            r"\bscone\b",
-            r"\broll\b",
-            r"\bbun\b",
-            r"\bfocaccia\b",
-            r"\bciabatta\b",
-            r"\bpizza\b",
-            r"\bflatbread\b",
-            r"\btortilla\b",
-            r"\bpancake\b",
-            r"\bwaffle\b",
-            r"\bcrepe\b",
-            r"\bcrêpe\b",
-        ),
-    ),
-    (
-        "breakfast",
-        (
-            r"\bbreakfast\b",
-            r"\begg\b",
-            r"\bombelet\b",
-            r"\bfrittata\b",
-            r"\bgranola\b",
-            r"\boatmeal\b",
-            r"\bporridge\b",
-            r"\bbrunch\b",
-        ),
-    ),
-    (
-        "sauce",
-        (
-            r"\bsauce\b",
-            r"\bdressing\b",
-            r"\bvinaigrette\b",
-            r"\bpesto\b",
-            r"\baioli\b",
-            r"\bgravy\b",
-            r"\bmarinade\b",
-            r"\brelish\b",
-            r"\bchutney\b",
-            r"\bsalsa\b",
-        ),
-    ),
-    (
-        "drink",
-        (
-            r"\bdrink\b",
-            r"\bbeverage\b",
-            r"\bcocktail\b",
-            r"\bsmoothie\b",
-            r"\bjuice\b",
-            r"\btea\b",
-            r"\bcoffee\b",
-            r"\bwine\b",
-            r"\blemonade\b",
-            r"\bpunch\b",
-        ),
-    ),
-    (
-        "grain",
-        (
-            r"\brice\b",
-            r"\brisotto\b",
-            r"\bquinoa\b",
-            r"\bcouscous\b",
-            r"\bbarley\b",
-            r"\bpolenta\b",
-            r"\bgrain\b",
-            r"\bbulgur\b",
-            r"\bfarro\b",
-        ),
-    ),
-    (
-        "vegetable",
-        (
-            r"\bvegetable\b",
-            r"\bveggie\b",
-            r"\bvegetarian\b",
-            r"\bvegan\b",
-            r"\basparagus\b",
-            r"\bbroccoli\b",
-            r"\bcauliflower\b",
-            r"\beggplant\b",
-            r"\baubergine\b",
-            r"\bzucchini\b",
-            r"\bcourgette\b",
-            r"\bspinach\b",
-            r"\bkale\b",
-            r"\btomato\b",
-            r"\bmushroom\b",
-            r"\bleek\b",
-            r"\bfennel\b",
-            r"\bpepper\b",
-            r"\bcabbage\b",
-            r"\bbean\b",
-            r"\blentil\b",
-            r"\bchickpea\b",
-        ),
-    ),
-)
-
-_COMPILED_RULES = tuple(
-    (slug, tuple(re.compile(pattern, re.I) for pattern in patterns))
-    for slug, patterns in _CATEGORY_RULES
+MIN_CORPUS_SCORE = 3.0
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "or",
+        "the",
+        "with",
+        "without",
+        "for",
+        "of",
+        "in",
+        "on",
+        "to",
+        "from",
+        "style",
+        "recipe",
+        "homemade",
+        "classic",
+        "easy",
+        "best",
+        "simple",
+        "variation",
+    }
 )
 
 
@@ -280,31 +58,12 @@ class ImageAssignment:
     key: str | None = None
 
 
-def category_asset_path(slug: str) -> Path:
-    return CATEGORY_DIR / f"{slug}.svg"
-
-
-def ensure_category_assets() -> None:
-    """Write packaged category SVGs if missing (idempotent)."""
-    CATEGORY_DIR.mkdir(parents=True, exist_ok=True)
-    for slug in CATEGORY_SLUGS:
-        path = category_asset_path(slug)
-        if not path.is_file():
-            path.write_text(_category_svg(slug), encoding="utf-8")
-
-
-def classify_recipe_category(
-    title: str,
-    cuisine: str | None = None,
-    tags: list[str] | None = None,
-) -> str:
-    haystack = " ".join(
-        part for part in [title, cuisine or "", " ".join(tags or [])] if part
-    ).lower()
-    for slug, patterns in _COMPILED_RULES:
-        if any(pattern.search(haystack) for pattern in patterns):
-            return slug
-    return "other"
+@dataclass(frozen=True)
+class CorpusEntry:
+    id: str
+    file: str
+    tags: frozenset[str]
+    cuisine: frozenset[str]
 
 
 def recipe_image_url(recipe_id: uuid.UUID, image_path: str | None) -> str | None:
@@ -324,16 +83,19 @@ def resolve_recipe_image_file(image_path: str) -> Path:
     if ".." in relative.split("/"):
         raise FileNotFoundError(image_path)
 
-    if relative.startswith("categories/"):
-        ensure_category_assets()
-        candidate = (CATEGORY_DIR / Path(relative).name).resolve()
+    if relative.startswith("corpus/"):
+        candidate = (PHOTOS_DIR / relative.removeprefix("corpus/")).resolve()
         try:
-            candidate.relative_to(CATEGORY_DIR.resolve())
+            candidate.relative_to(PHOTOS_DIR.resolve())
         except ValueError as exc:
             raise FileNotFoundError(image_path) from exc
         if not candidate.is_file():
             raise FileNotFoundError(image_path)
         return candidate
+
+    # Legacy category SVG paths — no longer served.
+    if relative.startswith("categories/"):
+        raise FileNotFoundError(image_path)
 
     upload_root = settings.upload_dir.resolve()
     candidate = (settings.upload_dir / relative).resolve()
@@ -348,7 +110,7 @@ def resolve_recipe_image_file(image_path: str) -> Path:
 
 def _guess_extension(name: str, content: bytes) -> str:
     lower = name.lower()
-    for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"):
+    for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
         if lower.endswith(ext):
             return ".jpg" if ext == ".jpeg" else ext
     if content.startswith(b"\x89PNG"):
@@ -357,8 +119,6 @@ def _guess_extension(name: str, content: bytes) -> str:
         return ".jpg"
     if content.startswith(b"RIFF") and b"WEBP" in content[:16]:
         return ".webp"
-    if content[:256].lstrip().startswith(b"<svg") or b"<svg" in content[:512]:
-        return ".svg"
     return ".bin"
 
 
@@ -380,7 +140,6 @@ def _save_extracted_image(
 def _image_too_small(content: bytes) -> bool:
     if len(content) < MIN_EXTRACTED_BYTES:
         return True
-    # Tiny 1x1 PNG / GIF placeholders
     if content.startswith(b"\x89PNG") and len(content) < 200:
         return True
     return False
@@ -388,6 +147,104 @@ def _image_too_small(content: bytes) -> bool:
 
 def _normalize_title(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().lower()
+
+
+def _tokenize(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw in re.findall(r"[a-z0-9]+", text.lower()):
+        if raw in _STOPWORDS or len(raw) < 3:
+            continue
+        token = raw[:-1] if len(raw) > 4 and raw.endswith("s") and not raw.endswith("ss") else raw
+        tokens.add(token)
+    return tokens
+
+
+def clear_corpus_cache() -> None:
+    load_corpus_manifest.cache_clear()
+
+
+@lru_cache(maxsize=1)
+def load_corpus_manifest() -> tuple[CorpusEntry, ...]:
+    if not MANIFEST_PATH.is_file():
+        return ()
+    try:
+        raw = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to load photo corpus manifest: %s", exc)
+        return ()
+    if not isinstance(raw, list):
+        return ()
+    entries: list[CorpusEntry] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        entry_id = str(item.get("id") or "").strip()
+        file_name = str(item.get("file") or "").strip().replace("\\", "/")
+        if not entry_id or not file_name or ".." in file_name.split("/"):
+            continue
+        tags = _tokenize(" ".join(str(tag) for tag in (item.get("tags") or [])))
+        cuisine = _tokenize(" ".join(str(c) for c in (item.get("cuisine") or [])))
+        if not tags and not cuisine:
+            continue
+        entries.append(
+            CorpusEntry(
+                id=entry_id,
+                file=file_name.lstrip("/"),
+                tags=frozenset(tags),
+                cuisine=frozenset(cuisine),
+            )
+        )
+    return tuple(sorted(entries, key=lambda entry: entry.id))
+
+
+def match_corpus_entry(
+    title: str,
+    cuisine: str | None = None,
+    tags: list[str] | None = None,
+) -> CorpusEntry | None:
+    catalog = load_corpus_manifest()
+    if not catalog:
+        return None
+    title_tokens = _tokenize(title)
+    tag_tokens = _tokenize(" ".join(tags or []))
+    cuisine_tokens = _tokenize(cuisine or "")
+    if not title_tokens and not tag_tokens and not cuisine_tokens:
+        return None
+
+    best: CorpusEntry | None = None
+    best_score = -1.0
+    for entry in catalog:
+        score = 0.0
+        score += 3.0 * len(title_tokens & entry.tags)
+        score += 2.0 * len(tag_tokens & entry.tags)
+        score += 1.5 * len(cuisine_tokens & entry.cuisine)
+        score += 1.0 * len(title_tokens & entry.cuisine)
+        if score > best_score or (score == best_score and best is not None and entry.id < best.id):
+            best = entry
+            best_score = score
+    if best is None or best_score < MIN_CORPUS_SCORE:
+        return None
+    return best
+
+
+def corpus_assignment(
+    title: str,
+    cuisine: str | None = None,
+    tags: list[str] | None = None,
+) -> ImageAssignment | None:
+    entry = match_corpus_entry(title, cuisine, tags)
+    if entry is None:
+        return None
+    relative_file = entry.file
+    disk_path = PHOTOS_DIR / relative_file
+    if not disk_path.is_file():
+        logger.warning("Corpus entry %s missing file %s", entry.id, relative_file)
+        return None
+    return ImageAssignment(
+        path=f"corpus/{relative_file}",
+        source=ImageSource.corpus,
+        key=f"corpus:{entry.id}",
+    )
 
 
 def _extract_epub_images_by_title(path: Path) -> dict[str, tuple[bytes, str]]:
@@ -463,10 +320,7 @@ def _extract_epub_images_by_title(path: Path) -> dict[str, tuple[bytes, str]]:
                     best_for_title = resolved
                 continue
 
-            classes = {
-                str(value).lower()
-                for value in (node.get("class") or [])
-            }
+            classes = {str(value).lower() for value in (node.get("class") or [])}
             text = " ".join(node.get_text(" ", strip=True).split())
             if not text:
                 continue
@@ -489,7 +343,6 @@ def _extract_pdf_page_image(path: Path, source_page: int | None) -> tuple[bytes,
         if source_page > document.page_count:
             return None
         page = document[source_page - 1]
-        # Prefer embedded images on the page.
         best: tuple[bytes, str] | None = None
         for image_info in page.get_images(full=True):
             xref = image_info[0]
@@ -510,11 +363,9 @@ def _extract_pdf_page_image(path: Path, source_page: int | None) -> tuple[bytes,
         if best is not None:
             return best
 
-        # Fallback: render the lower 55% of the page (common photo placement).
         rect = page.rect
         clip = fitz.Rect(rect.x0, rect.y0 + rect.height * 0.35, rect.x1, rect.y1)
         pixmap = page.get_pixmap(matrix=fitz.Matrix(1.25, 1.25), clip=clip, alpha=False)
-        # Skip near-blank renders (mostly white text pages).
         if pixmap.width * pixmap.height < 20_000:
             return None
         content = pixmap.tobytes("png")
@@ -546,7 +397,6 @@ def try_extract_recipe_image(
                 logger.warning("EPUB image index failed for %s: %s", cookbook_id, exc)
                 images = {}
         content_name = images.get(_normalize_title(title))
-        # Soft match: title contained in key or vice versa
         if content_name is None:
             needle = _normalize_title(title)
             for key, value in images.items():
@@ -568,16 +418,6 @@ def try_extract_recipe_image(
     return ImageAssignment(path=relative, source=ImageSource.extracted)
 
 
-def category_assignment(title: str, cuisine: str | None, tags: list[str] | None) -> ImageAssignment:
-    ensure_category_assets()
-    slug = classify_recipe_category(title, cuisine, tags)
-    return ImageAssignment(
-        path=f"categories/{slug}.svg",
-        source=ImageSource.category,
-        key=f"category:{slug}",
-    )
-
-
 def assign_image_for_recipe(
     cookbook_path: Path,
     *,
@@ -589,7 +429,7 @@ def assign_image_for_recipe(
     source_page: int | None,
     epub_images: dict[str, tuple[bytes, str]] | None = None,
     dest_dir: Path | None = None,
-) -> ImageAssignment:
+) -> ImageAssignment | None:
     extracted = try_extract_recipe_image(
         cookbook_path,
         cookbook_id=cookbook_id,
@@ -601,15 +441,26 @@ def assign_image_for_recipe(
     )
     if extracted is not None:
         return extracted
-    return category_assignment(title, cuisine, tags)
+    return corpus_assignment(title, cuisine, tags)
+
+
+def apply_assignment(recipe, assignment: ImageAssignment | None) -> None:
+    """Set or clear image fields on a Recipe ORM instance."""
+    if assignment is None:
+        recipe.image_path = None
+        recipe.image_source = None
+        recipe.image_key = None
+        return
+    recipe.image_path = assignment.path
+    recipe.image_source = assignment.source
+    recipe.image_key = assignment.key
 
 
 async def assign_images_for_cookbook(cookbook_id: str, cookbook_path: Path) -> None:
-    """Extract or classify images for every recipe in a cookbook."""
+    """Extract or corpus-match images for every recipe in a cookbook."""
     from app.db.session import SessionLocal
     from app.models import Recipe
 
-    ensure_category_assets()
     epub_images: dict[str, tuple[bytes, str]] | None = None
     if cookbook_path.suffix.lower() == ".epub":
         try:
@@ -634,9 +485,7 @@ async def assign_images_for_cookbook(cookbook_id: str, cookbook_path: Path) -> N
                     source_page=recipe.source_page,
                     epub_images=epub_images,
                 )
-                recipe.image_path = assignment.path
-                recipe.image_source = assignment.source
-                recipe.image_key = assignment.key
+                apply_assignment(recipe, assignment)
             except Exception as exc:
                 logger.warning(
                     "Recipe image assignment failed for %s/%s: %s",
@@ -644,11 +493,79 @@ async def assign_images_for_cookbook(cookbook_id: str, cookbook_path: Path) -> N
                     recipe.id,
                     exc,
                 )
-                fallback = category_assignment(recipe.title, recipe.cuisine, list(recipe.tags or []))
-                recipe.image_path = fallback.path
-                recipe.image_source = fallback.source
-                recipe.image_key = fallback.key
+                apply_assignment(recipe, corpus_assignment(recipe.title, recipe.cuisine, list(recipe.tags or [])))
         await db.commit()
+
+
+async def backfill_recipe_images(*, cookbook_id: str | None = None, force: bool = False) -> dict[str, int]:
+    """Reassign images: preserve extracted unless force; clear legacy category; try corpus."""
+    from app.db.session import SessionLocal
+    from app.models import Cookbook, Recipe
+
+    cleared = 0
+    corpus_hits = 0
+    extracted_kept = 0
+    async with SessionLocal() as db:
+        statement = select(Recipe)
+        if cookbook_id:
+            statement = statement.where(Recipe.cookbook_id == uuid.UUID(cookbook_id))
+        recipes = list(await db.scalars(statement))
+
+        cookbook_paths: dict[uuid.UUID, Path] = {}
+        if force:
+            for cookbook in await db.scalars(select(Cookbook)):
+                cookbook_paths[cookbook.id] = Path(cookbook.storage_path)
+
+        for recipe in recipes:
+            if recipe.image_source == ImageSource.extracted and not force:
+                extracted_kept += 1
+                continue
+
+            if force:
+                path = cookbook_paths.get(recipe.cookbook_id)
+                if path is not None and path.is_file():
+                    try:
+                        assignment = assign_image_for_recipe(
+                            path,
+                            cookbook_id=str(recipe.cookbook_id),
+                            recipe_id=str(recipe.id),
+                            title=recipe.title,
+                            cuisine=recipe.cuisine,
+                            tags=list(recipe.tags or []),
+                            source_page=recipe.source_page,
+                        )
+                        if recipe.image_source == ImageSource.category or (
+                            recipe.image_path and str(recipe.image_path).startswith("categories/")
+                        ):
+                            cleared += 1
+                        apply_assignment(recipe, assignment)
+                        if assignment and assignment.source == ImageSource.corpus:
+                            corpus_hits += 1
+                        elif assignment and assignment.source == ImageSource.extracted:
+                            extracted_kept += 1
+                        continue
+                    except Exception as exc:
+                        logger.warning("Force reassign failed for %s: %s", recipe.id, exc)
+
+            was_category = recipe.image_source == ImageSource.category or (
+                recipe.image_path and str(recipe.image_path).startswith("categories/")
+            )
+            assignment = corpus_assignment(recipe.title, recipe.cuisine, list(recipe.tags or []))
+            if assignment is not None:
+                apply_assignment(recipe, assignment)
+                corpus_hits += 1
+                if was_category:
+                    cleared += 1
+            else:
+                if was_category or recipe.image_path:
+                    cleared += 1
+                apply_assignment(recipe, None)
+        await db.commit()
+    return {
+        "cleared": cleared,
+        "corpus_hits": corpus_hits,
+        "extracted_kept": extracted_kept,
+    }
 
 
 def delete_cookbook_recipe_images(cookbook_id: str) -> None:
@@ -661,131 +578,3 @@ def delete_cookbook_recipe_images(cookbook_id: str) -> None:
             folder.rmdir()
         except OSError:
             pass
-
-
-def _category_svg(slug: str) -> str:
-    """Original flat illustrations in the app cream/sage/terracotta palette."""
-    motifs = {
-        "pasta": (
-            '<ellipse cx="400" cy="290" rx="190" ry="70" fill="#fff" stroke="#ddd7c9" stroke-width="6"/>'
-            '<path d="M250 250c40 35 80 35 120 0s80-35 120 0 80 35 120 0" fill="none" '
-            'stroke="#b65b3d" stroke-width="14" stroke-linecap="round"/>'
-            '<path d="M250 280c40 35 80 35 120 0s80-35 120 0 80 35 120 0" fill="none" '
-            'stroke="#7d9b78" stroke-width="12" stroke-linecap="round"/>'
-        ),
-        "soup": (
-            '<ellipse cx="400" cy="320" rx="170" ry="48" fill="#ddd7c9"/>'
-            '<path d="M230 250h340v70c0 55-76 100-170 100s-170-45-170-100z" fill="#7d9b78"/>'
-            '<path d="M260 250c20-55 60-90 140-90s120 35 140 90" fill="none" stroke="#b65b3d" '
-            'stroke-width="10" stroke-linecap="round"/>'
-            '<circle cx="340" cy="285" r="10" fill="#f8f5ed"/><circle cx="400" cy="300" r="8" fill="#f8f5ed"/>'
-            '<circle cx="455" cy="280" r="9" fill="#f8f5ed"/>'
-        ),
-        "salad": (
-            '<ellipse cx="400" cy="330" rx="180" ry="50" fill="#eee9dc"/>'
-            '<path d="M300 300c20-80 70-120 100-40 20-70 80-90 110-20 10-50 60-70 90 10 '
-            'c-70 40-140 60-300 50z" fill="#7d9b78"/>'
-            '<circle cx="360" cy="270" r="18" fill="#b65b3d"/>'
-            '<circle cx="430" cy="255" r="14" fill="#f8f5ed" stroke="#b65b3d" stroke-width="4"/>'
-            '<circle cx="470" cy="295" r="12" fill="#25312c"/>'
-        ),
-        "seafood": (
-            '<ellipse cx="400" cy="300" rx="150" ry="70" fill="#7d9b78"/>'
-            '<path d="M520 300c40-40 70-20 90 0-20 20-50 40-90 0z" fill="#b65b3d"/>'
-            '<circle cx="340" cy="285" r="10" fill="#f8f5ed"/>'
-            '<path d="M280 270c-20 10-30 30-20 45M270 310c20 10 40 5 55-10" fill="none" '
-            'stroke="#25312c" stroke-width="6" stroke-linecap="round"/>'
-        ),
-        "meat": (
-            '<path d="M290 220c80-70 220-70 300 10 40 40 30 120-20 150-90 55-220 40-280-20 '
-            'c-40-40-35-100 0-140z" fill="#b65b3d"/>'
-            '<path d="M340 250c50-20 120-15 160 25" fill="none" stroke="#f8f5ed" stroke-width="8" '
-            'stroke-linecap="round" opacity=".5"/>'
-            '<circle cx="520" cy="300" r="16" fill="#eee9dc"/>'
-        ),
-        "poultry": (
-            '<ellipse cx="390" cy="300" rx="140" ry="90" fill="#eee9dc" stroke="#ddd7c9" stroke-width="6"/>'
-            '<circle cx="500" cy="240" r="48" fill="#eee9dc" stroke="#ddd7c9" stroke-width="6"/>'
-            '<path d="M540 245c30 5 45 25 35 45" fill="none" stroke="#b65b3d" stroke-width="10" '
-            'stroke-linecap="round"/>'
-            '<circle cx="515" cy="230" r="7" fill="#25312c"/>'
-            '<path d="M300 320c-40 10-60 40-40 60h80" fill="#7d9b78"/>'
-        ),
-        "vegetable": (
-            '<path d="M400 340c-90-10-140-80-120-150 50 20 90 20 120-10 30 30 70 30 120 10 '
-            'c20 70-30 140-120 150z" fill="#7d9b78"/>'
-            '<path d="M400 180c0-40 20-70 0-100" fill="none" stroke="#25312c" stroke-width="10" '
-            'stroke-linecap="round"/>'
-            '<ellipse cx="330" cy="260" rx="18" ry="28" fill="#b65b3d" opacity=".85"/>'
-            '<ellipse cx="460" cy="250" rx="16" ry="24" fill="#f8f5ed" opacity=".9"/>'
-        ),
-        "dessert": (
-            '<path d="M260 320h280l-30 80H290z" fill="#b65b3d"/>'
-            '<path d="M250 320c20-90 80-140 150-140s130 50 150 140z" fill="#eee9dc" '
-            'stroke="#ddd7c9" stroke-width="6"/>'
-            '<circle cx="400" cy="230" r="22" fill="#7d9b78"/>'
-            '<path d="M390 210c-5-30 20-45 35-25" fill="none" stroke="#25312c" stroke-width="5"/>'
-        ),
-        "bread": (
-            '<ellipse cx="400" cy="300" rx="200" ry="90" fill="#b65b3d"/>'
-            '<ellipse cx="400" cy="280" rx="180" ry="70" fill="#d9845f"/>'
-            '<path d="M300 260c30-25 70-25 100 0M420 255c30-25 70-20 100 8" fill="none" '
-            'stroke="#f8f5ed" stroke-width="8" stroke-linecap="round" opacity=".55"/>'
-        ),
-        "sauce": (
-            '<path d="M340 200h120v40c40 10 60 40 60 80v80H280v-80c0-40 20-70 60-80z" fill="#7d9b78"/>'
-            '<rect x="360" y="160" width="80" height="50" rx="8" fill="#b65b3d"/>'
-            '<ellipse cx="400" cy="400" rx="90" ry="20" fill="#ddd7c9"/>'
-        ),
-        "breakfast": (
-            '<ellipse cx="400" cy="300" rx="160" ry="100" fill="#f8f5ed" stroke="#ddd7c9" stroke-width="8"/>'
-            '<circle cx="400" cy="300" r="70" fill="#eee9dc"/>'
-            '<circle cx="400" cy="300" r="36" fill="#b65b3d"/>'
-            '<path d="M250 250c20-40 40-40 60 0M530 250c20-40 40-40 60 0" fill="none" '
-            'stroke="#7d9b78" stroke-width="12" stroke-linecap="round"/>'
-        ),
-        "grain": (
-            '<ellipse cx="400" cy="340" rx="160" ry="45" fill="#ddd7c9"/>'
-            '<g fill="#b65b3d">'
-            '<ellipse cx="340" cy="300" rx="18" ry="10"/><ellipse cx="380" cy="285" rx="18" ry="10"/>'
-            '<ellipse cx="420" cy="300" rx="18" ry="10"/><ellipse cx="460" cy="285" rx="18" ry="10"/>'
-            '<ellipse cx="360" cy="320" rx="18" ry="10"/><ellipse cx="410" cy="325" rx="18" ry="10"/>'
-            '<ellipse cx="450" cy="315" rx="18" ry="10"/>'
-            "</g>"
-            '<path d="M300 250c40-60 100-60 140 0" fill="none" stroke="#7d9b78" stroke-width="10"/>'
-        ),
-        "stew": (
-            '<path d="M240 250h320l-30 160H270z" fill="#b65b3d"/>'
-            '<ellipse cx="400" cy="250" rx="170" ry="40" fill="#7d9b78"/>'
-            '<circle cx="360" cy="320" r="14" fill="#f8f5ed"/><circle cx="420" cy="340" r="12" fill="#eee9dc"/>'
-            '<circle cx="455" cy="310" r="10" fill="#25312c" opacity=".35"/>'
-        ),
-        "drink": (
-            '<path d="M330 180h140l-30 220H360z" fill="#7d9b78" opacity=".85"/>'
-            '<path d="M340 180h120v30H340z" fill="#eee9dc" stroke="#ddd7c9" stroke-width="4"/>'
-            '<ellipse cx="400" cy="420" rx="70" ry="18" fill="#ddd7c9"/>'
-            '<path d="M470 220c40 20 50 70 20 100" fill="none" stroke="#b65b3d" stroke-width="8" '
-            'stroke-linecap="round"/>'
-        ),
-        "other": (
-            '<circle cx="400" cy="270" r="110" fill="#eee9dc" stroke="#ddd7c9" stroke-width="8"/>'
-            '<path d="M350 250h100v80H350z" fill="#7d9b78"/>'
-            '<path d="M370 230h60v25H370z" fill="#b65b3d"/>'
-            '<circle cx="400" cy="290" r="14" fill="#f8f5ed"/>'
-        ),
-    }
-    art = motifs.get(slug, motifs["other"])
-    label = slug.replace("_", " ").title()
-    return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" role="img" aria-label="{label}">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#f8f5ed"/>
-      <stop offset="100%" stop-color="#eee9dc"/>
-    </linearGradient>
-  </defs>
-  <rect width="800" height="500" fill="url(#bg)"/>
-  <circle cx="120" cy="90" r="70" fill="#fff" fill-opacity=".45"/>
-  <circle cx="700" cy="420" r="90" fill="#7d9b78" fill-opacity=".12"/>
-  {art}
-</svg>
-'''

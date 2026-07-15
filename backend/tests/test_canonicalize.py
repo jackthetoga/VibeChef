@@ -81,7 +81,7 @@ async def test_canonicalize_ignores_missing_and_invalid_results(
 
 
 @pytest.mark.asyncio
-async def test_canonicalize_without_api_key_is_a_noop(
+async def test_canonicalize_without_api_key_applies_heuristics_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "openai_api_key", None)
@@ -96,10 +96,20 @@ async def test_canonicalize_without_api_key_is_a_noop(
     )
 
     async with SessionLocal() as db:
-        ingredient = Ingredient(name="light olive oil")
-        db.add(ingredient)
+        oil = Ingredient(name="light olive oil")
+        zest = Ingredient(name="lemon zest")
+        canned = Ingredient(name="canned imported italian plum tomatoes")
+        db.add_all([oil, zest, canned])
         await db.flush()
 
-        await canonicalize_ingredients(db, [ingredient])
+        await canonicalize_ingredients(db, [oil, zest, canned])
 
-        assert ingredient.canonical_id is None
+        assert oil.canonical_id is None
+        assert zest.canonical_id is not None
+        lemon = await db.get(Ingredient, zest.canonical_id)
+        assert lemon is not None
+        assert lemon.name == "lemon"
+        assert canned.canonical_id is not None
+        root = await db.get(Ingredient, canned.canonical_id)
+        assert root is not None
+        assert root.name == "canned tomatoes"

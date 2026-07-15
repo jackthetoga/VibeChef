@@ -7,6 +7,7 @@ import {
   NotebookPen,
   Pencil,
   Plus,
+  Receipt,
   Refrigerator,
   Search,
   Sparkles,
@@ -36,6 +37,8 @@ type ScanDraftRow = {
   quantity: string
   unit: string
 }
+
+type ScanMode = 'grocery' | 'receipt'
 
 function itemName(item: PantryItem) {
   return item.ingredient?.name || item.ingredient_name || item.name || 'Ingredient'
@@ -75,9 +78,11 @@ export function FridgePage() {
   const [inventoryText, setInventoryText] = useState('')
   const [textError, setTextError] = useState('')
   const [scanOpen, setScanOpen] = useState(false)
+  const [scanMode, setScanMode] = useState<ScanMode>('grocery')
   const [scanDrafts, setScanDrafts] = useState<ScanDraftRow[]>([])
   const [scanError, setScanError] = useState('')
   const scanInputRef = useRef<HTMLInputElement>(null)
+  const receiptInputRef = useRef<HTMLInputElement>(null)
   const [ingredientQuery, setIngredientQuery] = useState('')
   const [selected, setSelected] = useState<Ingredient | null>(null)
   const [quantity, setQuantity] = useState('')
@@ -258,6 +263,24 @@ export function FridgePage() {
         toast.error('No groceries detected. Try a clearer photo.')
         return
       }
+      setScanMode('grocery')
+      setScanDrafts(draftsFromScan(result.items))
+      setScanError('')
+      setScanOpen(true)
+    },
+  })
+
+  const scanReceipt = useMutation({
+    mutationFn: (file: File) => pantryApi.scanReceipt(file),
+    onError: (error) => {
+      toast.error(error.message)
+    },
+    onSuccess: (result) => {
+      if (!result.items.length) {
+        toast.error('No receipt items detected. Try a clearer photo.')
+        return
+      }
+      setScanMode('receipt')
       setScanDrafts(draftsFromScan(result.items))
       setScanError('')
       setScanOpen(true)
@@ -265,7 +288,10 @@ export function FridgePage() {
   })
 
   const confirmScan = useMutation({
-    mutationFn: (items: PantryConfirmItem[]) => pantryApi.confirm(items),
+    mutationFn: (items: PantryConfirmItem[]) =>
+      scanMode === 'receipt'
+        ? pantryApi.confirmReceipt(items)
+        : pantryApi.confirm(items),
     onError: (error) => {
       setScanError(error.message)
       toast.error(error.message)
@@ -405,6 +431,17 @@ export function FridgePage() {
     scanPhoto.mutate(file)
   }
 
+  const onReceiptFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (!file.type.startsWith('image/')) {
+      toast.error('Please choose a photo (JPEG, PNG, or WebP).')
+      return
+    }
+    scanReceipt.mutate(file)
+  }
+
   const updateScanDraft = (key: string, patch: Partial<ScanDraftRow>) => {
     setScanDrafts((current) =>
       current.map((row) => (row.key === key ? { ...row, ...patch } : row)),
@@ -463,6 +500,16 @@ export function FridgePage() {
         tabIndex={-1}
         onChange={onScanFileChange}
       />
+      <input
+        ref={receiptInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        className="sr-only"
+        aria-hidden
+        tabIndex={-1}
+        onChange={onReceiptFileChange}
+      />
       <div className="flex flex-col justify-between gap-5 sm:flex-row sm:items-end">
         <div>
           <p className="mb-2 text-xs font-bold uppercase tracking-[.18em] text-terracotta">Your ingredients</p>
@@ -473,11 +520,20 @@ export function FridgePage() {
           <Button
             variant="secondary"
             size="lg"
-            disabled={scanPhoto.isPending}
+            disabled={scanPhoto.isPending || scanReceipt.isPending}
             onClick={() => scanInputRef.current?.click()}
           >
             <Camera className="size-5" />
             {scanPhoto.isPending ? 'Scanning…' : 'Scan groceries'}
+          </Button>
+          <Button
+            variant="secondary"
+            size="lg"
+            disabled={scanPhoto.isPending || scanReceipt.isPending}
+            onClick={() => receiptInputRef.current?.click()}
+          >
+            <Receipt className="size-5" />
+            {scanReceipt.isPending ? 'Scanning…' : 'Scan receipt'}
           </Button>
           <Button variant="secondary" size="lg" onClick={() => setTextOpen(true)}>
             <NotebookPen className="size-5" /> Update from notes
@@ -532,11 +588,19 @@ export function FridgePage() {
           <div className="mt-5 flex flex-wrap justify-center gap-2">
             <Button
               variant="secondary"
-              disabled={scanPhoto.isPending}
+              disabled={scanPhoto.isPending || scanReceipt.isPending}
               onClick={() => scanInputRef.current?.click()}
             >
               <Camera className="size-4" />
               {scanPhoto.isPending ? 'Scanning…' : 'Scan groceries'}
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={scanPhoto.isPending || scanReceipt.isPending}
+              onClick={() => receiptInputRef.current?.click()}
+            >
+              <Receipt className="size-4" />
+              {scanReceipt.isPending ? 'Scanning…' : 'Scan receipt'}
             </Button>
             <Button variant="secondary" onClick={() => setTextOpen(true)}>
               <NotebookPen className="size-4" /> Update from notes
@@ -860,7 +924,7 @@ export function FridgePage() {
           setScanOpen(false)
           setScanError('')
         }}
-        title="Review scanned groceries"
+        title={scanMode === 'receipt' ? 'Review receipt items' : 'Review scanned groceries'}
         className="sm:max-w-2xl"
       >
         <form className="grid gap-4" onSubmit={submitScanConfirm}>
@@ -919,7 +983,9 @@ export function FridgePage() {
                       </div>
                       {alreadyInFridge && row.name.trim() && (
                         <p className="text-xs font-semibold text-terracotta">
-                          Already in fridge — quantity will be updated
+                          {scanMode === 'receipt'
+                            ? 'Already in fridge — quantity will be added'
+                            : 'Already in fridge — quantity will be updated'}
                         </p>
                       )}
                     </div>

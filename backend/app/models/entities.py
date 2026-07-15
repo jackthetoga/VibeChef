@@ -49,7 +49,8 @@ class UploadStatus(StrEnum):
 
 class ImageSource(StrEnum):
     extracted = "extracted"
-    category = "category"
+    category = "category"  # legacy SVG fallbacks; cleared by backfill
+    corpus = "corpus"
     generated = "generated"
     user = "user"
     none = "none"
@@ -124,6 +125,7 @@ class Recipe(UUIDTimestampMixin, Base):
         Index("ix_recipes_protein", "protein_grams", "id"),
         Index("ix_recipes_title", "title", "id"),
         Index("ix_recipes_cuisine", "cuisine"),
+        Index("ix_recipes_rating", "rating", "id"),
     )
 
     cookbook_id: Mapped[uuid.UUID] = mapped_column(
@@ -146,7 +148,10 @@ class Recipe(UUIDTimestampMixin, Base):
     )
     nutrition_coverage: Mapped[Decimal | None] = mapped_column(Numeric(5, 4))
     cuisine: Mapped[str | None] = mapped_column(String(120))
+    rating: Mapped[Decimal | None] = mapped_column(Numeric(4, 2))
+    rating_count: Mapped[int | None] = mapped_column(Integer)
     tags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    tag_source: Mapped[str | None] = mapped_column(String(20))
     steps: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     source_page: Mapped[int | None] = mapped_column(Integer)
     parse_warnings: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)

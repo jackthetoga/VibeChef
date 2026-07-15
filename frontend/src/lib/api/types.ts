@@ -77,6 +77,8 @@ export interface Recipe {
   title: string
   description?: string | null
   cuisine?: string | null
+  rating?: number | null
+  rating_count?: number | null
   source?: string | null
   source_url?: string | null
   source_page?: number | null
@@ -93,7 +95,17 @@ export interface Recipe {
   nutrition?: Nutrition | null
   cookbook_id?: string
   cookbook_title?: string | null
+  tags?: string[]
+  tag_source?: string | null
   parse_warnings?: string[]
+}
+
+export interface RecipeTagUpdate {
+  cuisine?: string | null
+  category?: string | null
+  food_groups?: string[]
+  dish_tags?: string[]
+  tags?: string[]
 }
 
 export interface CursorPage<T> {
@@ -109,8 +121,12 @@ export interface RecipeFilters {
   max_time?: number
   min_protein?: number
   cuisine?: string
+  category?: string
+  food_group?: string
+  /** Extra tags combined with AND; not used for cuisine (cuisine is exclusive). */
+  tag?: string[]
   cookbook_id?: string
-  sort?: 'relevance' | 'time' | 'calories' | 'protein' | 'title'
+  sort?: 'relevance' | 'time' | 'calories' | 'protein' | 'title' | 'rating'
   order?: 'asc' | 'desc'
   cursor?: string
   limit?: number
@@ -187,6 +203,18 @@ export interface PantryConfirmResult {
   added: PantryItem[]
   updated: PantryItem[]
   skipped_existing?: string[]
+}
+
+export interface RecipeCookItem {
+  ingredient_id: string
+  quantity?: number | null
+  unit?: string | null
+}
+
+export interface RecipeCookResult {
+  updated: PantryItem[]
+  removed: string[]
+  skipped: string[]
 }
 
 export interface Cookbook {

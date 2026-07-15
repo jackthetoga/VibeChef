@@ -11,24 +11,194 @@ import {
   Flame,
   Gauge,
   Refrigerator,
+  Sparkles,
   UsersRound,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { pantryApi, recipesApi } from '../lib/api/client'
-import { formatMinutes } from '../lib/utils'
-import { formatQuantity } from '../lib/units'
+import type { Recipe, RecipeCookItem, RecipeIngredient, RecipeTagUpdate } from '../lib/api/types'
+import { cn, formatMinutes } from '../lib/utils'
+import { formatQuantity, UNIT_GROUPS } from '../lib/units'
 import { RecipeImage } from '../components/app-shell'
-import { Badge, Button, Card, Skeleton } from '../components/ui'
+import { Badge, Button, Card, Dialog, Field, Input, Select, Skeleton } from '../components/ui'
+
+const TAG_CATEGORIES = [
+  '',
+  'main dish',
+  'side dish',
+  'salad',
+  'soup',
+  'sauce',
+  'dessert',
+  'breakfast',
+  'bread',
+  'snack',
+  'beverage',
+] as const
+
+const TAG_FOOD_GROUPS = [
+  { value: 'vegetables', label: 'Vegetables' },
+  { value: 'fruits', label: 'Fruits' },
+  { value: 'grains', label: 'Grains' },
+  { value: 'protein-foods', label: 'Protein Foods' },
+  { value: 'dairy', label: 'Dairy' },
+] as const
+
+const TAG_CUISINES = [
+  '',
+  'Italian',
+  'Mexican',
+  'Mediterranean',
+  'Asian',
+  'Indian',
+  'American',
+  'Chinese',
+] as const
+
+const TAG_DISH_TAGS = ['pasta', 'seafood', 'stew', 'meat', 'poultry', 'grain', 'vegetable'] as const
+
+const CATEGORY_SET = new Set(TAG_CATEGORIES.filter(Boolean))
+const FOOD_GROUP_SET = new Set(TAG_FOOD_GROUPS.map((group) => group.value))
+const DISH_TAG_SET = new Set(TAG_DISH_TAGS)
+
+function splitTags(tags: string[] | undefined) {
+  let category = ''
+  const food_groups: string[] = []
+  const dish_tags: string[] = []
+  for (const raw of tags || []) {
+    const tag = raw.trim().toLowerCase()
+    if (!tag) continue
+    if (CATEGORY_SET.has(tag as (typeof TAG_CATEGORIES)[number]) && !category) {
+      category = tag
+      continue
+    }
+    const group = tag.replace(/ /g, '-')
+    if (FOOD_GROUP_SET.has(group as (typeof TAG_FOOD_GROUPS)[number]['value']) && !food_groups.includes(group)) {
+      food_groups.push(group)
+      continue
+    }
+    if (tag === 'protein foods' && !food_groups.includes('protein-foods')) {
+      food_groups.push('protein-foods')
+      continue
+    }
+    if (DISH_TAG_SET.has(tag as (typeof TAG_DISH_TAGS)[number]) && !dish_tags.includes(tag)) {
+      dish_tags.push(tag)
+    }
+  }
+  return { category, food_groups, dish_tags }
+}
+
+interface CookDraftRow {
+  key: string
+  recipeIngredientId?: string
+  ingredientId: string
+  name: string
+  quantity: string
+  unit: string
+  used: boolean
+  matchStatus?: RecipeIngredient['match_status']
+  pantryQuantity?: number | null
+  pantryUnit?: string | null
+  alternates?: NonNullable<RecipeIngredient['alternates']>
+  isStaple: boolean
+}
+
+function quantityToInput(value?: number | string | null) {
+  if (value == null || value === '') return ''
+  const numeric = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(numeric)) return String(value)
+  return String(numeric)
+}
+
+function buildCookDrafts(recipe: Recipe): CookDraftRow[] {
+  return (recipe.ingredients || []).map((ingredient, index) => {
+    const isStaple = ingredient.match_status === 'staple'
+    return {
+      key: `${ingredient.ingredient_id || ingredient.id || ingredient.name}-${index}`,
+      recipeIngredientId: ingredient.id,
+      ingredientId: ingredient.ingredient_id || '',
+      name: ingredient.alternates?.length
+        ? ingredient.alternates.find((alt) => alt.ingredient_id === ingredient.ingredient_id)?.name ||
+          ingredient.alternates[0]?.name ||
+          ingredient.name
+        : ingredient.name,
+      quantity: quantityToInput(ingredient.quantity),
+      unit: ingredient.unit || '',
+      used: !isStaple,
+      matchStatus: ingredient.match_status,
+      pantryQuantity: ingredient.pantry_quantity,
+      pantryUnit: ingredient.pantry_unit,
+      alternates: ingredient.alternates || undefined,
+      isStaple,
+    }
+  }).filter((row) => Boolean(row.ingredientId))
+}
+
+function cookToast(result: { updated: unknown[]; removed: string[]; skipped: string[] }) {
+  const deducted = result.updated.length + result.removed.length
+  if (deducted && result.skipped.length) {
+    toast.success(
+      `Updated ${deducted} fridge item${deducted === 1 ? '' : 's'} · ${result.skipped.length} not in fridge`,
+    )
+  } else if (deducted) {
+    toast.success(`Subtracted ingredients from your fridge`)
+  } else if (result.skipped.length) {
+    toast.message('None of those ingredients were in your fridge')
+  } else {
+    toast.message('Nothing to update in your fridge')
+  }
+}
 
 export function RecipeDetailPage() {
   const { recipeId } = useParams({ strict: false }) as { recipeId?: string }
   const client = useQueryClient()
   const [checked, setChecked] = useState<Set<number>>(new Set())
+  const [cookOpen, setCookOpen] = useState(false)
+  const [cookDrafts, setCookDrafts] = useState<CookDraftRow[]>([])
+  const [cookError, setCookError] = useState('')
+  const [tagsOpen, setTagsOpen] = useState(false)
+  const [tagDraft, setTagDraft] = useState({
+    cuisine: '',
+    category: '',
+    food_groups: [] as string[],
+    dish_tags: [] as string[],
+  })
+
   const recipe = useQuery({
     queryKey: ['recipe', recipeId],
     queryFn: () => recipesApi.get(recipeId || ''),
     enabled: Boolean(recipeId),
   })
+
+  const invalidateAfterPantryChange = () => {
+    void client.invalidateQueries({ queryKey: ['pantry'] })
+    void client.invalidateQueries({ queryKey: ['recipe', recipeId] })
+    void client.invalidateQueries({ queryKey: ['recipes'] })
+  }
+
+  const openTagEditor = () => {
+    if (!recipe.data) return
+    const parts = splitTags(recipe.data.tags)
+    setTagDraft({
+      cuisine: recipe.data.cuisine || '',
+      category: parts.category,
+      food_groups: parts.food_groups,
+      dish_tags: parts.dish_tags,
+    })
+    setTagsOpen(true)
+  }
+
+  const saveTags = useMutation({
+    mutationFn: (input: RecipeTagUpdate) => recipesApi.update(recipeId || '', input),
+    onSuccess: (updated) => {
+      client.setQueryData(['recipe', recipeId], updated)
+      void client.invalidateQueries({ queryKey: ['recipes'] })
+      setTagsOpen(false)
+      toast.success('Tags updated')
+    },
+    onError: (error) => toast.error(error.message),
+  })
+
   const addMissing = useMutation({
     mutationFn: (names: string[]) => pantryApi.createBulk(names.map((name) => ({ name }))),
     onSuccess: (result) => {
@@ -41,12 +211,72 @@ export function RecipeDetailPage() {
       } else {
         toast.message('Those ingredients are already in your fridge')
       }
-      void client.invalidateQueries({ queryKey: ['pantry'] })
-      void client.invalidateQueries({ queryKey: ['recipe', recipeId] })
-      void client.invalidateQueries({ queryKey: ['recipes'] })
+      invalidateAfterPantryChange()
     },
     onError: (error) => toast.error(error.message),
   })
+
+  const cookRecipe = useMutation({
+    mutationFn: (items?: RecipeCookItem[]) => recipesApi.cook(recipeId || '', items),
+    onSuccess: (result) => {
+      cookToast(result)
+      setCookOpen(false)
+      setCookError('')
+      invalidateAfterPantryChange()
+    },
+    onError: (error) => {
+      setCookError(error.message)
+      toast.error(error.message)
+    },
+  })
+
+  const openCookDialog = () => {
+    if (!recipe.data) return
+    setCookDrafts(buildCookDrafts(recipe.data))
+    setCookError('')
+    setCookOpen(true)
+  }
+
+  const updateCookDraft = (key: string, patch: Partial<CookDraftRow>) => {
+    setCookDrafts((rows) => rows.map((row) => (row.key === key ? { ...row, ...patch } : row)))
+  }
+
+  const submitCookReview = (event: React.FormEvent) => {
+    event.preventDefault()
+    const used = cookDrafts.filter((row) => row.used)
+    if (used.length === 0) {
+      setCookError('Check at least one ingredient you used, or skip the review.')
+      return
+    }
+    const items: RecipeCookItem[] = []
+    for (const row of used) {
+      if (row.quantity.trim() === '') {
+        items.push({
+          ingredient_id: row.ingredientId,
+          quantity: null,
+          unit: row.unit || null,
+        })
+        continue
+      }
+      const quantity = Number(row.quantity)
+      if (!Number.isFinite(quantity) || quantity < 0) {
+        setCookError(`Enter a valid quantity for ${row.name}`)
+        return
+      }
+      items.push({
+        ingredient_id: row.ingredientId,
+        quantity,
+        unit: row.unit || null,
+      })
+    }
+    setCookError('')
+    cookRecipe.mutate(items)
+  }
+
+  const skipCookReview = () => {
+    setCookError('')
+    cookRecipe.mutate(undefined)
+  }
 
   if (!recipeId) {
     return (
@@ -102,6 +332,10 @@ export function RecipeDetailPage() {
         : [ingredient.name],
     )
     .filter(Boolean)
+  const canCook = (data.ingredients || []).some(
+    (ingredient) => ingredient.ingredient_id && ingredient.match_status !== 'staple',
+  )
+  const tagParts = splitTags(data.tags)
 
   return (
     <article className="mx-auto max-w-6xl p-4 sm:p-8 xl:p-10">
@@ -116,11 +350,22 @@ export function RecipeDetailPage() {
           className="min-h-72 md:min-h-[430px]"
         />
         <div className="flex flex-col justify-center p-6 sm:p-10">
-          <div className="mb-4 flex flex-wrap gap-2">
+          <div className="mb-4 flex flex-wrap items-center gap-2">
             <Badge tone={data.makeable ? 'green' : 'amber'}>
               {data.makeable ? 'Ready from your fridge' : `${data.missing_ingredients || 0} ingredients missing`}
             </Badge>
             {data.cuisine && <Badge>{data.cuisine}</Badge>}
+            {tagParts.category && <Badge tone="neutral">{tagParts.category}</Badge>}
+            {tagParts.food_groups.map((group) => (
+              <Badge key={group} tone="neutral">{group.replace('-', ' ')}</Badge>
+            ))}
+            <button
+              type="button"
+              className="text-xs font-bold text-sage-dark underline-offset-2 hover:underline"
+              onClick={openTagEditor}
+            >
+              Edit tags
+            </button>
           </div>
           <h1 className="font-display text-4xl font-bold leading-tight tracking-tight text-ink sm:text-5xl">{data.title}</h1>
           {data.cookbook_title && (
@@ -141,17 +386,23 @@ export function RecipeDetailPage() {
               </span>
             </div>
           </div>
-          {missingNames.length > 0 && (
-            <Button
-              className="mt-5 self-start"
-              variant="secondary"
-              disabled={addMissing.isPending}
-              onClick={() => addMissing.mutate(missingNames)}
-            >
-              <Refrigerator className="size-4" />
-              {addMissing.isPending ? 'Adding…' : `Add ${missingNames.length} missing to fridge`}
-            </Button>
-          )}
+          <div className="mt-5 flex flex-wrap gap-2">
+            {canCook && (
+              <Button onClick={openCookDialog}>
+                <Sparkles className="size-4" /> I made this
+              </Button>
+            )}
+            {missingNames.length > 0 && (
+              <Button
+                variant="secondary"
+                disabled={addMissing.isPending}
+                onClick={() => addMissing.mutate(missingNames)}
+              >
+                <Refrigerator className="size-4" />
+                {addMissing.isPending ? 'Adding…' : `Add ${missingNames.length} missing to fridge`}
+              </Button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -281,7 +532,16 @@ export function RecipeDetailPage() {
         </div>
 
         <Card className="p-5 sm:p-8">
-          <h2 className="flex items-center gap-2 font-display text-2xl font-bold text-ink"><ChefHat className="size-6" /> Let’s cook</h2>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <h2 className="flex items-center gap-2 font-display text-2xl font-bold text-ink">
+              <ChefHat className="size-6" /> Let’s cook
+            </h2>
+            {canCook && (
+              <Button size="sm" variant="secondary" onClick={openCookDialog}>
+                <Sparkles className="size-3.5" /> I made this
+              </Button>
+            )}
+          </div>
           {(data.steps || []).length === 0 ? (
             <p className="mt-7 text-sm text-muted">No steps were extracted for this recipe.</p>
           ) : (
@@ -309,6 +569,271 @@ export function RecipeDetailPage() {
           )}
         </Card>
       </div>
+
+      <Dialog
+        open={cookOpen}
+        onClose={() => {
+          if (cookRecipe.isPending) return
+          setCookOpen(false)
+          setCookError('')
+        }}
+        title="I made this"
+        className="sm:max-w-2xl"
+      >
+        <form className="grid gap-4" onSubmit={submitCookReview}>
+          <p className="text-sm text-muted">
+            Check what you used and tweak amounts if needed. We’ll subtract those from your fridge.
+          </p>
+          {cookDrafts.length === 0 ? (
+            <p className="text-sm text-muted">This recipe has no ingredients to subtract.</p>
+          ) : (
+            <div className="max-h-[50vh] space-y-3 overflow-auto pr-1">
+              {cookDrafts.map((row) => {
+                const selectedAlternate = row.alternates?.find(
+                  (alt) => alt.ingredient_id === row.ingredientId,
+                )
+                return (
+                  <div
+                    key={row.key}
+                    className={`rounded-2xl border p-3 transition ${
+                      row.used ? 'border-line bg-white' : 'border-line/70 bg-sand/60 opacity-70'
+                    }`}
+                  >
+                    <div className="flex items-start gap-3">
+                      <button
+                        type="button"
+                        aria-pressed={row.used}
+                        aria-label={`${row.used ? 'Uncheck' : 'Check'} ${row.name}`}
+                        className={`mt-1 grid size-5 shrink-0 place-items-center rounded-md border ${
+                          row.used ? 'border-sage bg-sage text-white' : 'border-line bg-white'
+                        }`}
+                        onClick={() => updateCookDraft(row.key, { used: !row.used })}
+                      >
+                        {row.used && <Check className="size-3" />}
+                      </button>
+                      <div className="min-w-0 flex-1 grid gap-2">
+                        {row.alternates && row.alternates.length > 1 ? (
+                          <Field label="Used">
+                            <Select
+                              disabled={!row.used}
+                              value={row.ingredientId}
+                              onChange={(event) => {
+                                const alternate = row.alternates?.find(
+                                  (alt) => alt.ingredient_id === event.target.value,
+                                )
+                                updateCookDraft(row.key, {
+                                  ingredientId: event.target.value,
+                                  name: alternate?.name || row.name,
+                                  quantity: quantityToInput(
+                                    alternate?.quantity ?? (selectedAlternate?.quantity ?? row.quantity),
+                                  ),
+                                  unit: alternate?.unit || row.unit,
+                                })
+                              }}
+                            >
+                              {row.alternates.map((alternate) => (
+                                <option
+                                  key={alternate.ingredient_id || alternate.name}
+                                  value={alternate.ingredient_id || ''}
+                                >
+                                  {alternate.name}
+                                </option>
+                              ))}
+                            </Select>
+                          </Field>
+                        ) : (
+                          <p className="text-sm font-semibold text-ink">
+                            {row.name}
+                            {row.isStaple && (
+                              <Badge className="ml-2" tone="green">Staple</Badge>
+                            )}
+                          </p>
+                        )}
+                        <div className="grid grid-cols-2 gap-2">
+                          <Field label="Quantity">
+                            <Input
+                              min="0"
+                              step="any"
+                              type="number"
+                              disabled={!row.used}
+                              placeholder="Amount"
+                              value={row.quantity}
+                              onChange={(event) =>
+                                updateCookDraft(row.key, { quantity: event.target.value })
+                              }
+                            />
+                          </Field>
+                          <Field label="Unit">
+                            <Select
+                              disabled={!row.used}
+                              value={row.unit}
+                              onChange={(event) =>
+                                updateCookDraft(row.key, { unit: event.target.value })
+                              }
+                            >
+                              <option value="">None</option>
+                              {row.unit &&
+                                !UNIT_GROUPS.some((group) =>
+                                  group.units.some(([value]) => value === row.unit),
+                                ) && <option value={row.unit}>{row.unit}</option>}
+                              {UNIT_GROUPS.map((group) => (
+                                <optgroup key={group.label} label={group.label}>
+                                  {group.units.map(([value, label]) => (
+                                    <option key={value} value={value}>{label}</option>
+                                  ))}
+                                </optgroup>
+                              ))}
+                            </Select>
+                          </Field>
+                        </div>
+                        {row.matchStatus === 'missing' && (
+                          <p className="text-xs font-semibold text-muted">Not currently in your fridge</p>
+                        )}
+                        {row.matchStatus === 'insufficient' && (
+                          <p className="text-xs font-semibold text-amber-800">
+                            Fridge has {formatQuantity(row.pantryQuantity, row.pantryUnit)}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+          {cookError && <p role="alert" className="text-sm font-semibold text-rose-700">{cookError}</p>}
+          <div className="grid gap-2 sm:grid-cols-2">
+            <Button
+              type="button"
+              variant="secondary"
+              disabled={cookRecipe.isPending || !canCook}
+              onClick={skipCookReview}
+            >
+              Skip review
+            </Button>
+            <Button type="submit" disabled={cookRecipe.isPending || cookDrafts.every((row) => !row.used)}>
+              {cookRecipe.isPending ? 'Updating…' : 'Update fridge'}
+            </Button>
+          </div>
+          <p className="text-xs text-muted">
+            Skip review uses the recipe’s default amounts for non-staple ingredients.
+          </p>
+        </form>
+      </Dialog>
+
+      <Dialog
+        open={tagsOpen}
+        onClose={() => {
+          if (saveTags.isPending) return
+          setTagsOpen(false)
+        }}
+        title="Edit tags"
+        className="sm:max-w-lg"
+      >
+        <form
+          className="grid gap-5"
+          onSubmit={(event) => {
+            event.preventDefault()
+            saveTags.mutate({
+              cuisine: tagDraft.cuisine || null,
+              category: tagDraft.category || null,
+              food_groups: tagDraft.food_groups,
+              dish_tags: tagDraft.dish_tags,
+            })
+          }}
+        >
+          <p className="text-sm text-muted">
+            Category, food groups, and dish tags stack in filters. Cuisine is exclusive — only one at a time.
+          </p>
+          <Field label="Category">
+            <Select
+              value={tagDraft.category}
+              onChange={(event) => setTagDraft((current) => ({ ...current, category: event.target.value }))}
+            >
+              <option value="">No category</option>
+              {TAG_CATEGORIES.filter(Boolean).map((category) => (
+                <option key={category} value={category}>
+                  {category}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <Field label="Cuisine">
+            <Select
+              value={tagDraft.cuisine}
+              onChange={(event) => setTagDraft((current) => ({ ...current, cuisine: event.target.value }))}
+            >
+              <option value="">No cuisine</option>
+              {TAG_CUISINES.filter(Boolean).map((cuisine) => (
+                <option key={cuisine} value={cuisine}>
+                  {cuisine}
+                </option>
+              ))}
+            </Select>
+          </Field>
+          <div>
+            <p className="mb-2 text-sm font-bold text-ink">Food groups</p>
+            <div className="flex flex-wrap gap-2">
+              {TAG_FOOD_GROUPS.map((group) => {
+                const active = tagDraft.food_groups.includes(group.value)
+                return (
+                  <button
+                    key={group.value}
+                    type="button"
+                    aria-pressed={active}
+                    className={cn(
+                      'rounded-full border px-3 py-1.5 text-sm font-semibold transition',
+                      active ? 'border-ink bg-ink text-cream' : 'border-line bg-white text-ink hover:bg-sand',
+                    )}
+                    onClick={() =>
+                      setTagDraft((current) => ({
+                        ...current,
+                        food_groups: active
+                          ? current.food_groups.filter((value) => value !== group.value)
+                          : [...current.food_groups, group.value],
+                      }))
+                    }
+                  >
+                    {group.label}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+          <div>
+            <p className="mb-2 text-sm font-bold text-ink">Dish tags</p>
+            <div className="flex flex-wrap gap-2">
+              {TAG_DISH_TAGS.map((dish) => {
+                const active = tagDraft.dish_tags.includes(dish)
+                return (
+                  <button
+                    key={dish}
+                    type="button"
+                    aria-pressed={active}
+                    className={cn(
+                      'rounded-full border px-3 py-1.5 text-sm font-semibold capitalize transition',
+                      active ? 'border-ink bg-ink text-cream' : 'border-line bg-white text-ink hover:bg-sand',
+                    )}
+                    onClick={() =>
+                      setTagDraft((current) => ({
+                        ...current,
+                        dish_tags: active
+                          ? current.dish_tags.filter((value) => value !== dish)
+                          : [...current.dish_tags, dish],
+                      }))
+                    }
+                  >
+                    {dish}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+          <Button type="submit" disabled={saveTags.isPending}>
+            {saveTags.isPending ? 'Saving…' : 'Save tags'}
+          </Button>
+        </form>
+      </Dialog>
     </article>
   )
 }

@@ -43,6 +43,12 @@ def heuristic_canonical_name(name: str) -> str | None:
         "canned" in words or "tinned" in words
     ):
         return "canned tomatoes"
+    # Import locally to avoid a circular import at module load.
+    from app.services.derivatives import parent_food_name
+
+    parent = parent_food_name(name)
+    if parent is not None:
+        return parent
     return None
 
 
@@ -104,6 +110,9 @@ def _canonicalization_prompt(
         "canonicalize the input name itself; do not invent a second option here.\n"
         "- Canned/tinned tomato products (including plum, diced, crushed, imported Italian) "
         "canonicalize to canned tomatoes, not fresh tomatoes or plain plum tomatoes.\n"
+        "- Zest, peel, rind, and juice of a fruit/vegetable canonicalize to the whole food "
+        "(lemon zest → lemon). Do not collapse powders or dried forms "
+        "(garlic powder stays garlic powder).\n"
         "- Prefer an exact name from EXISTING CANONICALS when it applies. Otherwise return a "
         "short, lowercase ingredient noun phrase.\n"
         "- Use the optional source line for context when the input name is truncated or messy.\n"

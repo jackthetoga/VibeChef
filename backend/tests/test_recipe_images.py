@@ -1,4 +1,4 @@
-"""Tests for recipe imagery classification, assets, and extraction."""
+"""Tests for recipe imagery extraction and photorealistic corpus matching."""
 
 from pathlib import Path
 
@@ -6,10 +6,10 @@ import pytest
 from ebooklib import epub
 
 from app.services.recipe_images import (
-    CATEGORY_SLUGS,
     assign_image_for_recipe,
-    classify_recipe_category,
-    ensure_category_assets,
+    clear_corpus_cache,
+    corpus_assignment,
+    match_corpus_entry,
     resolve_recipe_image_file,
     try_extract_recipe_image,
 )
@@ -32,7 +32,7 @@ def _write_epub_with_recipe_image(path: Path) -> None:
         uid="pasta_img",
         file_name="images/pasta.png",
         media_type="image/png",
-        content=_PNG_64 * 40,  # inflate past MIN_EXTRACTED_BYTES
+        content=_PNG_64 * 40,
     )
     book.add_item(image)
 
@@ -54,41 +54,11 @@ def _write_epub_with_recipe_image(path: Path) -> None:
     book.spine = ["nav", chapter]
     epub.write_epub(str(path), book)
 
-
-@pytest.mark.parametrize(
-    ("title", "expected"),
-    [
-        ("Tomato Spaghetti", "pasta"),
-        ("Chicken Noodle Soup", "soup"),
-        ("Grilled Salmon", "seafood"),
-        ("Chocolate Cake", "dessert"),
-        ("Mystery Dish", "other"),
-    ],
-)
-def test_classify_recipe_category(title: str, expected: str) -> None:
-    assert classify_recipe_category(title) == expected
-
-
-def test_ensure_category_assets_writes_svgs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from app.services import recipe_images
-
-    monkeypatch.setattr(recipe_images, "CATEGORY_DIR", tmp_path)
-    ensure_category_assets()
-    for slug in CATEGORY_SLUGS:
-        path = tmp_path / f"{slug}.svg"
-        assert path.is_file()
-        assert "<svg" in path.read_text(encoding="utf-8")
-
-
-def test_resolve_category_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.services import recipe_images
-
-    monkeypatch.setattr(recipe_images, "CATEGORY_DIR", tmp_path)
-    ensure_category_assets()
-    resolved = resolve_recipe_image_file("categories/pasta.svg")
-    assert resolved == (tmp_path / "pasta.svg").resolve()
+@pytest.fixture(autouse=True)
+def _clear_corpus_cache() -> None:
+    clear_corpus_cache()
+    yield
+    clear_corpus_cache()
 
 
 def test_epub_recipe_image_extraction(tmp_path: Path) -> None:
@@ -107,10 +77,14 @@ def test_epub_recipe_image_extraction(tmp_path: Path) -> None:
     assert (tmp_path / assignment.path).is_file()
 
 
-def test_assign_falls_back_to_category(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_assign_without_corpus_returns_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from app.services import recipe_images
 
-    monkeypatch.setattr(recipe_images, "CATEGORY_DIR", tmp_path / "categories")
+    monkeypatch.setattr(recipe_images, "MANIFEST_PATH", tmp_path / "manifest.json")
+    monkeypatch.setattr(recipe_images, "PHOTOS_DIR", tmp_path)
+    (tmp_path / "manifest.json").write_text("[]", encoding="utf-8")
+    clear_corpus_cache()
+
     text_book = tmp_path / "plain.txt"
     text_book.write_text("no images here", encoding="utf-8")
     assignment = assign_image_for_recipe(
@@ -123,6 +97,108 @@ def test_assign_falls_back_to_category(tmp_path: Path, monkeypatch: pytest.Monke
         source_page=None,
         dest_dir=tmp_path,
     )
-    assert assignment.source.value == "category"
-    assert assignment.path == "categories/pasta.svg"
-    assert assignment.key == "category:pasta"
+    assert assignment is None
+
+
+def test_corpus_match_hit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import recipe_images
+
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    photo = photos / "risotto_01.jpg"
+    photo.write_bytes(b"\xff\xd8\xff" + b"0" * 100)
+    (tmp_path / "manifest.json").write_text(
+        """
+        [
+          {
+            "id": "risotto_01",
+            "file": "photos/risotto_01.jpg",
+            "tags": ["risotto", "rice", "arborio"],
+            "cuisine": ["italian"]
+          }
+        ]
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(recipe_images, "MANIFEST_PATH", tmp_path / "manifest.json")
+    monkeypatch.setattr(recipe_images, "PHOTOS_DIR", tmp_path)
+    clear_corpus_cache()
+
+    entry = match_corpus_entry("Mushroom Risotto", cuisine="Italian", tags=[])
+    assert entry is not None
+    assert entry.id == "risotto_01"
+
+    assignment = corpus_assignment("Mushroom Risotto", "Italian", [])
+    assert assignment is not None
+    assert assignment.source.value == "corpus"
+    assert assignment.path == "corpus/photos/risotto_01.jpg"
+    assert assignment.key == "corpus:risotto_01"
+    assert resolve_recipe_image_file(assignment.path) == photo.resolve()
+
+
+def test_corpus_match_miss(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import recipe_images
+
+    (tmp_path / "manifest.json").write_text(
+        """
+        [
+          {
+            "id": "risotto_01",
+            "file": "photos/risotto_01.jpg",
+            "tags": ["risotto", "rice"],
+            "cuisine": ["italian"]
+          }
+        ]
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(recipe_images, "MANIFEST_PATH", tmp_path / "manifest.json")
+    monkeypatch.setattr(recipe_images, "PHOTOS_DIR", tmp_path)
+    clear_corpus_cache()
+
+    assert match_corpus_entry("Mystery Dish XYZ", cuisine=None, tags=[]) is None
+    assert corpus_assignment("Mystery Dish XYZ") is None
+
+
+def test_legacy_category_paths_are_rejected() -> None:
+    with pytest.raises(FileNotFoundError):
+        resolve_recipe_image_file("categories/pasta.svg")
+
+
+def test_extract_wins_over_corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import recipe_images
+
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    (photos / "pasta_01.jpg").write_bytes(b"\xff\xd8\xff" + b"0" * 100)
+    (tmp_path / "manifest.json").write_text(
+        """
+        [
+          {
+            "id": "pasta_01",
+            "file": "photos/pasta_01.jpg",
+            "tags": ["pasta", "tomato", "spaghetti"],
+            "cuisine": ["italian"]
+          }
+        ]
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(recipe_images, "MANIFEST_PATH", tmp_path / "manifest.json")
+    monkeypatch.setattr(recipe_images, "PHOTOS_DIR", tmp_path)
+    clear_corpus_cache()
+
+    epub_path = tmp_path / "book.epub"
+    _write_epub_with_recipe_image(epub_path)
+    assignment = assign_image_for_recipe(
+        epub_path,
+        cookbook_id="11111111-1111-1111-1111-111111111111",
+        recipe_id="22222222-2222-2222-2222-222222222222",
+        title="Tomato Pasta",
+        cuisine="Italian",
+        tags=["pasta"],
+        source_page=None,
+        dest_dir=tmp_path,
+    )
+    assert assignment is not None
+    assert assignment.source.value == "extracted"

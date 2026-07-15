@@ -19,6 +19,7 @@ from app.schemas.api import (
     PantryBulkOut,
     PantryConfirmCreate,
     PantryConfirmOut,
+    PantryConfirmReceiptCreate,
     PantryCreate,
     PantryFromTextCreate,
     PantryFromTextOut,
@@ -40,6 +41,7 @@ from app.services.pantry_text import apply_quantity_delta, parse_pantry_text
 from app.services.pantry_vision import (
     MAX_IMAGE_BYTES,
     scan_groceries_from_image,
+    scan_receipt_from_image,
     sniff_image_media_type,
 )
 
@@ -459,13 +461,8 @@ async def update_pantry_from_text(
     )
 
 
-@pantry_router.post("/scan", response_model=PantryScanOut)
-async def scan_pantry_photo(
-    user: CurrentUser,
-    file: UploadFile = File(...),
-) -> PantryScanOut:
-    del user  # auth required; scan is read-only
-    original = Path(file.filename or "grocery.jpg")
+async def _read_pantry_image(file: UploadFile, *, default_filename: str) -> tuple[bytes, str]:
+    original = Path(file.filename or default_filename)
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Uploaded image is empty")
@@ -478,6 +475,47 @@ async def scan_pantry_photo(
         media_type = sniff_image_media_type(content, file.content_type, original.name)
     except ValueError as exc:
         raise HTTPException(status_code=415, detail=str(exc)) from exc
+    return content, media_type
+
+
+async def _resolve_confirm_ingredients(
+    db: DB,
+    names: list[str],
+) -> dict[str, Ingredient]:
+    ingredients = list(
+        await db.scalars(select(Ingredient).where(func.lower(Ingredient.name).in_(names)))
+    )
+    by_name = {ingredient.name.lower(): ingredient for ingredient in ingredients}
+
+    for name in names:
+        if name not in by_name:
+            ingredient = Ingredient(
+                name=name,
+                category=COMMON_INGREDIENT_CATEGORIES.get(name),
+            )
+            db.add(ingredient)
+            by_name[name] = ingredient
+        elif not by_name[name].category:
+            by_name[name].category = COMMON_INGREDIENT_CATEGORIES.get(name)
+    await db.flush()
+    await canonicalize_ingredients(
+        db,
+        [ingredient for ingredient in by_name.values() if ingredient.canonical_id is None],
+        timeout=12.0,
+    )
+
+    for name in names:
+        await ensure_ingredient_category(by_name[name])
+    return by_name
+
+
+@pantry_router.post("/scan", response_model=PantryScanOut)
+async def scan_pantry_photo(
+    user: CurrentUser,
+    file: UploadFile = File(...),
+) -> PantryScanOut:
+    del user  # auth required; scan is read-only
+    content, media_type = await _read_pantry_image(file, default_filename="grocery.jpg")
 
     try:
         items = await scan_groceries_from_image(content=content, media_type=media_type)
@@ -485,6 +523,35 @@ async def scan_pantry_photo(
         raise HTTPException(
             status_code=502,
             detail="Could not analyze the grocery photo. Try again with a clearer image.",
+        ) from exc
+
+    return PantryScanOut(
+        items=[
+            PantryScanItemOut(
+                name=item.name,
+                quantity=item.quantity,
+                unit=item.unit,
+                confidence=item.confidence,
+            )
+            for item in items
+        ]
+    )
+
+
+@pantry_router.post("/scan-receipt", response_model=PantryScanOut)
+async def scan_pantry_receipt(
+    user: CurrentUser,
+    file: UploadFile = File(...),
+) -> PantryScanOut:
+    del user  # auth required; scan is read-only
+    content, media_type = await _read_pantry_image(file, default_filename="receipt.jpg")
+
+    try:
+        items = await scan_receipt_from_image(content=content, media_type=media_type)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not analyze the receipt photo. Try again with a clearer image.",
         ) from exc
 
     return PantryScanOut(
@@ -512,31 +579,7 @@ async def confirm_pantry_scan(
             (item.quantity, item.unit, item.expiry_date),
         )
     names = list(by_request)
-
-    ingredients = list(
-        await db.scalars(select(Ingredient).where(func.lower(Ingredient.name).in_(names)))
-    )
-    by_name = {ingredient.name.lower(): ingredient for ingredient in ingredients}
-
-    for name in names:
-        if name not in by_name:
-            ingredient = Ingredient(
-                name=name,
-                category=COMMON_INGREDIENT_CATEGORIES.get(name),
-            )
-            db.add(ingredient)
-            by_name[name] = ingredient
-        elif not by_name[name].category:
-            by_name[name].category = COMMON_INGREDIENT_CATEGORIES.get(name)
-    await db.flush()
-    await canonicalize_ingredients(
-        db,
-        [ingredient for ingredient in by_name.values() if ingredient.canonical_id is None],
-        timeout=12.0,
-    )
-
-    for name in names:
-        await ensure_ingredient_category(by_name[name])
+    by_name = await _resolve_confirm_ingredients(db, names)
 
     pantry_items = list(
         await db.scalars(
@@ -575,6 +618,80 @@ async def confirm_pantry_scan(
 
         existing.quantity = quantity
         existing.unit = unit
+        if expiry_date is not None:
+            existing.expiry_date = expiry_date
+        existing.ingredient = ingredient
+        updated.append(existing)
+
+    await db.commit()
+    for item in added + updated:
+        await db.refresh(item)
+        for ingredient in by_name.values():
+            if ingredient.id == item.ingredient_id:
+                item.ingredient = ingredient
+                break
+
+    return PantryConfirmOut(added=added, updated=updated)
+
+
+@pantry_router.post("/confirm-receipt", response_model=PantryConfirmOut)
+async def confirm_pantry_receipt(
+    body: PantryConfirmReceiptCreate, db: DB, user: CurrentUser
+) -> PantryConfirmOut:
+    # Preserve first occurrence order while deduping by name.
+    by_request: dict[str, tuple[Decimal | None, str | None, date | None]] = {}
+    for item in body.items:
+        by_request.setdefault(
+            item.ingredient_name,
+            (item.quantity, item.unit, item.expiry_date),
+        )
+    names = list(by_request)
+    by_name = await _resolve_confirm_ingredients(db, names)
+
+    pantry_items = list(
+        await db.scalars(
+            select(PantryItem)
+            .options(selectinload(PantryItem.ingredient))
+            .where(
+                PantryItem.user_id == user.id,
+                PantryItem.ingredient_id.in_([by_name[name].id for name in names]),
+            )
+        )
+    )
+    by_ingredient_id = {item.ingredient_id: item for item in pantry_items}
+
+    added: list[PantryItem] = []
+    updated: list[PantryItem] = []
+    for name in names:
+        ingredient = by_name[name]
+        quantity, unit, expiry_date = by_request[name]
+        existing = by_ingredient_id.get(ingredient.id)
+        if existing is None:
+            defaults = COMMON_INGREDIENT_DEFAULTS.get(name)
+            if defaults and quantity is None:
+                quantity, unit = defaults
+            item = PantryItem(
+                user_id=user.id,
+                ingredient_id=ingredient.id,
+                quantity=quantity,
+                unit=unit,
+                expiry_date=expiry_date,
+            )
+            item.ingredient = ingredient
+            db.add(item)
+            by_ingredient_id[ingredient.id] = item
+            added.append(item)
+            continue
+
+        new_quantity, new_unit, _ = apply_quantity_delta(
+            existing.quantity,
+            existing.unit,
+            quantity,
+            unit,
+            sign=1,
+        )
+        existing.quantity = new_quantity
+        existing.unit = new_unit
         if expiry_date is not None:
             existing.expiry_date = expiry_date
         existing.ingredient = ingredient

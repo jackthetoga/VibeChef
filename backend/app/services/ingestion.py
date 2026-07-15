@@ -19,6 +19,7 @@ from app.models import Cookbook, Ingredient, Recipe, RecipeIngredient, UploadSta
 from app.services.canonicalize import canonicalize_ingredients, resolve_or_alternates
 from app.services.llm import chat_completion
 from app.services.nutrition import apply_printed_nutrition_metadata
+from app.services.recipe_tagging import assign_recipe_tags
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,25 @@ RECIPE_STEP_CLASSES = frozenset(
 )
 # Variation intro/body prose often carries the only instructions.
 RECIPE_VARIATION_BODY_CLASSES = frozenset({"rvf", "rvhn"})
+
+# Simon & Schuster / Salt Fat Acid Heat-style recipe dialect.
+SS_TITLE_CLASSES = frozenset({"h2rec", "h2rec1"})
+SS_YIELD_CLASSES = frozenset({"right2"})
+SS_INGREDIENT_CLASSES = frozenset({"item", "item1", "itemb"})
+SS_PROSE_CLASSES = frozenset({"noindent", "indent"})
+SS_VARIATION_HEADER_CLASSES = frozenset({"h5", "h5a"})
+SS_VARIATION_BULLET_CLASSES = frozenset({"bull1", "bull1b"})
+
+STRUCTURAL_SECTION_INGREDIENTS_RE = re.compile(
+    r"(?i)^(?:ingredients?|what you.?ll need|you will need)\s*:?$"
+)
+STRUCTURAL_SECTION_STEPS_RE = re.compile(
+    r"(?i)^(?:instructions?|directions?|method|preparation)\s*:?$"
+)
+STRUCTURAL_YIELD_RE = re.compile(r"(?i)^(?:serves|makes|yield|for)\b.{0,60}$")
+STRUCTURAL_VARIATIONS_RE = re.compile(r"(?i)^variations?\s*:?$")
+MIN_STRUCTURAL_INGREDIENTS = 2
+MIN_STRUCTURAL_BOOK_RECIPES = 1
 
 UNIT_PATTERN = (
     r"tablespoons?|tbsp|teaspoons?|tsp|cups?|ounces?|oz|pounds?|lbs?|grams?|g|"
@@ -192,6 +212,8 @@ class ExtractedRecipe(BaseModel):
     carbs_grams: Decimal | None = Field(default=None, ge=0)
     fat_grams: Decimal | None = Field(default=None, ge=0)
     cuisine: str | None = Field(default=None, max_length=120)
+    rating: Decimal | None = Field(default=None, ge=0, le=5)
+    rating_count: int | None = Field(default=None, ge=0)
     tags: list[str] = Field(default_factory=list)
     steps: list[str] = Field(default_factory=list)
     source_page: int | None = Field(default=None, ge=1)
@@ -264,7 +286,7 @@ def parse_number(value: str) -> Decimal | None:
 
 
 def parse_servings(text: str) -> Decimal | None:
-    """Parse yield lines like 'For 6 servings' or 'For 6 to 12 servings'."""
+    """Parse yield lines like 'For 6 servings', 'Serves 4 to 6', or 'Makes 12'."""
     normalized = _normalize_amount_text(text)
     # Volume yields ("About 1 2/3 cups", "1 1/2 to 2 quarts") are not servings.
     if re.search(
@@ -273,16 +295,16 @@ def parse_servings(text: str) -> Decimal | None:
     ):
         return None
     match = re.search(
-        r"(?i)(?:for\s+)?(\d+)(?:\s*(?:to|-|–|—|/)\s*(\d+))?\s*"
+        r"(?i)(?:(?:for|serves|makes)\s+)?(\d+)(?:\s*(?:to|-|–|—|/)\s*(\d+))?\s*"
         r"(?:or\s+more\s+)?"
         r"(?:servings?|people|persons?|guests?|canap[eé]s?|portions?)?\b",
         normalized,
     )
     if not match:
         return None
-    # Require an explicit serving-like cue, or a leading "For N".
+    # Require an explicit serving-like cue.
     if not re.search(
-        r"(?i)\b(?:for|servings?|people|persons?|guests?|canap[eé]s?|portions?)\b",
+        r"(?i)\b(?:for|serves|makes|servings?|people|persons?|guests?|canap[eé]s?|portions?)\b",
         normalized,
     ):
         return None
@@ -522,14 +544,17 @@ def deduplicate_recipes(recipes: list[ExtractedRecipe]) -> list[ExtractedRecipe]
 async def resolve_ingredient(
     db: AsyncSession, extracted: ExtractedIngredient
 ) -> Ingredient:
+    from app.services.staples import is_staple_name
+
     name = extracted.canonical_name
+    staple = extracted.staple or is_staple_name(name)
     ingredient = await db.scalar(select(Ingredient).where(func.lower(Ingredient.name) == name))
     if ingredient is None:
         candidate = Ingredient(
             name=name,
             aliases=extracted.aliases,
             category=extracted.category,
-            staple=extracted.staple,
+            staple=staple,
         )
         try:
             async with db.begin_nested():
@@ -544,7 +569,7 @@ async def resolve_ingredient(
                 raise RuntimeError(f"Ingredient creation conflicted but {name!r} was not found")
 
     ingredient.aliases = sorted(set(ingredient.aliases + extracted.aliases))
-    ingredient.staple = ingredient.staple or extracted.staple
+    ingredient.staple = ingredient.staple or staple
     ingredient.category = ingredient.category or extracted.category
     return ingredient
 
@@ -625,20 +650,52 @@ def _paragraph_classes(tag) -> set[str]:
     return {str(value).lower() for value in (tag.get("class") or [])}
 
 
-def _epub_has_recipe_markup(book) -> bool:
+def _epub_class_hit_counts(
+    book,
+    *,
+    title_classes: frozenset[str],
+    ingredient_classes: frozenset[str],
+) -> tuple[int, int]:
     title_hits = 0
     ingredient_hits = 0
     for item in _iter_epub_documents(book):
         soup = BeautifulSoup(item.get_content(), "html.parser")
         for tag in soup.find_all(True, class_=True):
             classes = _paragraph_classes(tag)
-            if classes & RECIPE_TITLE_CLASSES:
+            if classes & title_classes:
                 title_hits += 1
-            if classes & RECIPE_INGREDIENT_CLASSES:
+            if classes & ingredient_classes:
                 ingredient_hits += 1
             if title_hits >= 5 and ingredient_hits >= 10:
-                return True
-    return title_hits >= 3 and ingredient_hits >= 5
+                return title_hits, ingredient_hits
+    return title_hits, ingredient_hits
+
+
+def _epub_has_knopf_markup(book) -> bool:
+    title_hits, ingredient_hits = _epub_class_hit_counts(
+        book,
+        title_classes=RECIPE_TITLE_CLASSES,
+        ingredient_classes=RECIPE_INGREDIENT_CLASSES,
+    )
+    return (title_hits >= 5 and ingredient_hits >= 10) or (
+        title_hits >= 3 and ingredient_hits >= 5
+    )
+
+
+def _epub_has_simon_schuster_markup(book) -> bool:
+    title_hits, ingredient_hits = _epub_class_hit_counts(
+        book,
+        title_classes=SS_TITLE_CLASSES,
+        ingredient_classes=SS_INGREDIENT_CLASSES,
+    )
+    return (title_hits >= 5 and ingredient_hits >= 10) or (
+        title_hits >= 3 and ingredient_hits >= 5
+    )
+
+
+def _epub_has_recipe_markup(book) -> bool:
+    """Backward-compatible alias: Knopf-style markup only."""
+    return _epub_has_knopf_markup(book)
 
 
 def _is_non_ingredient_line(text: str) -> bool:
@@ -1051,19 +1108,299 @@ def _parse_structured_epub_document(content: bytes | str) -> list[ExtractedRecip
     return recipes
 
 
+def _parse_simon_schuster_epub_document(content: bytes | str) -> list[ExtractedRecipe]:
+    """Parse SFAH-style recipes: h2rec title, right2 yield, item* ingredients."""
+    soup = BeautifulSoup(content, "html.parser")
+    recipes: list[ExtractedRecipe] = []
+
+    current_title: str | None = None
+    yield_text: str | None = None
+    ingredient_lines: list[tuple[str | None, str]] = []
+    steps: list[str] = []
+    # before_ingredients | in_ingredients | in_steps | in_variations
+    phase = "before_ingredients"
+
+    def flush() -> None:
+        nonlocal current_title, yield_text, ingredient_lines, steps, phase
+        if current_title is None:
+            return
+        recipe = _finalize_structured_recipe(
+            title=current_title,
+            yield_text=yield_text,
+            variation_body=[],
+            ingredient_lines=ingredient_lines,
+            steps=steps,
+        )
+        if recipe is not None and recipe.ingredients:
+            recipes.append(recipe)
+        current_title = None
+        yield_text = None
+        ingredient_lines = []
+        steps = []
+        phase = "before_ingredients"
+
+    for tag in soup.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6"]):
+        classes = _paragraph_classes(tag)
+        text = " ".join(tag.get_text(" ", strip=True).split())
+        if not text:
+            continue
+
+        if classes & SS_TITLE_CLASSES:
+            flush()
+            current_title = text
+            phase = "before_ingredients"
+            continue
+
+        if current_title is None:
+            continue
+
+        if classes & SS_VARIATION_HEADER_CLASSES and STRUCTURAL_VARIATIONS_RE.match(text):
+            phase = "in_variations"
+            continue
+
+        if phase == "in_variations" or classes & SS_VARIATION_BULLET_CLASSES:
+            # Phase 1: skip variation bullets; do not treat as recipes/steps.
+            continue
+
+        if classes & SS_YIELD_CLASSES:
+            yield_text = text
+            continue
+
+        if classes & SS_INGREDIENT_CLASSES:
+            ingredient_lines.append((None, text))
+            phase = "in_ingredients"
+            continue
+
+        if classes & SS_PROSE_CLASSES:
+            if phase == "before_ingredients":
+                # Headnote between title/yield and the ingredient list — not steps.
+                continue
+            if phase in {"in_ingredients", "in_steps"}:
+                steps.append(text)
+                phase = "in_steps"
+            continue
+
+    flush()
+    return recipes
+
+
+def _looks_like_ingredient_line(text: str) -> bool:
+    cleaned = " ".join(text.split()).strip()
+    if not cleaned or len(cleaned) > 180:
+        return False
+    if STRUCTURAL_SECTION_INGREDIENTS_RE.match(cleaned):
+        return False
+    if STRUCTURAL_SECTION_STEPS_RE.match(cleaned):
+        return False
+    if STRUCTURAL_VARIATIONS_RE.match(cleaned):
+        return False
+    if STRUCTURAL_YIELD_RE.match(cleaned):
+        return False
+    if _is_non_ingredient_line(cleaned):
+        return False
+    # Numbered directions are steps, not ingredients.
+    if re.match(r"^\d+[.)]\s+\S", cleaned):
+        return False
+    normalized = _normalize_amount_text(cleaned)
+    if re.match(rf"(?i)^{AMOUNT_TOKEN}\b", normalized):
+        return True
+    lower = cleaned.lower().rstrip(".")
+    staples = {
+        "salt",
+        "pepper",
+        "black pepper",
+        "freshly ground black pepper",
+        "flaky salt",
+        "kosher salt",
+        "sea salt",
+        "olive oil",
+        "extra-virgin olive oil",
+        "extra virgin olive oil",
+        "water",
+        "butter",
+    }
+    return lower in staples
+
+
+def _is_structural_title_candidate(tag_name: str, text: str) -> bool:
+    cleaned = " ".join(text.split()).strip()
+    if len(cleaned) < 3 or len(cleaned) > 80:
+        return False
+    if STRUCTURAL_SECTION_INGREDIENTS_RE.match(cleaned):
+        return False
+    if STRUCTURAL_SECTION_STEPS_RE.match(cleaned):
+        return False
+    if STRUCTURAL_VARIATIONS_RE.match(cleaned):
+        return False
+    if STRUCTURAL_YIELD_RE.match(cleaned):
+        return False
+    if tag_name in {"h1", "h2", "h3", "h4"}:
+        return True
+    # Allow short title-case paragraphs only when they look like dish names.
+    if tag_name == "p" and not cleaned.endswith("."):
+        letters = re.sub(r"[^A-Za-z]+", "", cleaned)
+        if letters and letters[0].isupper() and " " in cleaned:
+            return True
+    return False
+
+
+def _parse_structural_epub_document(content: bytes | str) -> list[ExtractedRecipe]:
+    """CSS-agnostic recipe recovery from headings + ingredient-like runs."""
+    soup = BeautifulSoup(content, "html.parser")
+    blocks: list[tuple[str, str]] = []
+    for tag in soup.find_all(["p", "h1", "h2", "h3", "h4", "h5", "h6", "li"]):
+        text = " ".join(tag.get_text(" ", strip=True).split())
+        if text:
+            blocks.append((tag.name, text))
+
+    recipes: list[ExtractedRecipe] = []
+    index = 0
+    while index < len(blocks):
+        tag_name, text = blocks[index]
+        if not _is_structural_title_candidate(tag_name, text):
+            index += 1
+            continue
+
+        title = text
+        cursor = index + 1
+        yield_text: str | None = None
+        ingredient_lines: list[tuple[str | None, str]] = []
+        steps: list[str] = []
+        in_ingredient_section = False
+        in_step_section = False
+        saw_explicit_sections = False
+
+        while cursor < len(blocks):
+            next_tag, next_text = blocks[cursor]
+            if cursor > index and _is_structural_title_candidate(next_tag, next_text):
+                # Next recipe title — stop without consuming it.
+                break
+            if STRUCTURAL_VARIATIONS_RE.match(next_text):
+                break
+            if STRUCTURAL_YIELD_RE.match(next_text) and not ingredient_lines and not steps:
+                yield_text = next_text
+                cursor += 1
+                continue
+            if STRUCTURAL_SECTION_INGREDIENTS_RE.match(next_text):
+                in_ingredient_section = True
+                in_step_section = False
+                saw_explicit_sections = True
+                cursor += 1
+                continue
+            if STRUCTURAL_SECTION_STEPS_RE.match(next_text):
+                in_ingredient_section = False
+                in_step_section = True
+                saw_explicit_sections = True
+                cursor += 1
+                continue
+
+            if in_step_section:
+                steps.append(next_text)
+                cursor += 1
+                continue
+
+            if in_ingredient_section or (
+                not saw_explicit_sections
+                and (
+                    next_tag == "li"
+                    or _looks_like_ingredient_line(next_text)
+                )
+            ):
+                # Once steps have started without an Ingredients heading, stop
+                # treating prose as ingredients.
+                if (
+                    not in_ingredient_section
+                    and ingredient_lines
+                    and not _looks_like_ingredient_line(next_text)
+                    and next_tag != "li"
+                ):
+                    in_step_section = True
+                    steps.append(next_text)
+                    cursor += 1
+                    continue
+                if _is_non_ingredient_line(next_text) and next_tag != "li":
+                    cursor += 1
+                    continue
+                ingredient_lines.append((None, next_text))
+                cursor += 1
+                continue
+
+            if ingredient_lines and not in_ingredient_section:
+                # Prose after an implicit ingredient run → steps.
+                in_step_section = True
+                steps.append(next_text)
+                cursor += 1
+                continue
+
+            # Headnote / unrelated prose before ingredients — skip.
+            cursor += 1
+
+        if len(ingredient_lines) >= MIN_STRUCTURAL_INGREDIENTS:
+            recipe = _finalize_structured_recipe(
+                title=title,
+                yield_text=yield_text,
+                variation_body=[],
+                ingredient_lines=ingredient_lines,
+                steps=steps,
+            )
+            if recipe is not None and recipe.ingredients:
+                recipes.append(recipe)
+            index = cursor
+        else:
+            index += 1
+
+    return recipes
+
+
+def _finalize_profile_recipes(recipes: list[ExtractedRecipe]) -> list[ExtractedRecipe]:
+    return expand_ambiguous_or_ingredients_sync(quality_assure_recipes(recipes))
+
+
 def extract_structured_epub_recipes(path: Path) -> list[ExtractedRecipe] | None:
-    """Parse recipes from Knopf-style CSS classes when present; else return None."""
+    """Parse recipes via exclusive cascade: Knopf → S&S → structural → None."""
     if path.suffix.lower() != ".epub":
         return None
     from ebooklib import epub
 
     book = epub.read_epub(str(path), options={"ignore_ncx": True})
-    if not _epub_has_recipe_markup(book):
-        return None
-    recipes: list[ExtractedRecipe] = []
-    for item in _iter_epub_documents(book):
-        recipes.extend(_parse_structured_epub_document(item.get_content()))
-    return expand_ambiguous_or_ingredients_sync(quality_assure_recipes(recipes))
+    documents = list(_iter_epub_documents(book))
+
+    if _epub_has_knopf_markup(book):
+        recipes: list[ExtractedRecipe] = []
+        for item in documents:
+            recipes.extend(_parse_structured_epub_document(item.get_content()))
+        finalized = _finalize_profile_recipes(recipes)
+        logger.info(
+            "Knopf EPUB profile recovered %s recipes from %s",
+            len(finalized),
+            path.name,
+        )
+        return finalized
+
+    if _epub_has_simon_schuster_markup(book):
+        recipes = []
+        for item in documents:
+            recipes.extend(_parse_simon_schuster_epub_document(item.get_content()))
+        finalized = _finalize_profile_recipes(recipes)
+        logger.info(
+            "Simon & Schuster EPUB profile recovered %s recipes from %s",
+            len(finalized),
+            path.name,
+        )
+        return finalized
+
+    recipes = []
+    for item in documents:
+        recipes.extend(_parse_structural_epub_document(item.get_content()))
+    finalized = _finalize_profile_recipes(recipes)
+    if len(finalized) >= MIN_STRUCTURAL_BOOK_RECIPES:
+        logger.info(
+            "Structural EPUB profile recovered %s recipes from %s",
+            len(finalized),
+            path.name,
+        )
+        return finalized
+    return None
 
 
 def _read_text_file(path: Path) -> str:
@@ -1214,14 +1551,15 @@ def chunk_sections(sections: list[str]) -> list[str]:
 
 
 def demo_ingredient(raw: str) -> ExtractedIngredient:
+    from app.services.staples import is_staple_name
+
     canonical, cleaned, quantity, unit = _parse_ingredient_parts(raw)
-    staples = {"salt", "water", "black pepper", "pepper", "olive oil", "vegetable oil"}
     return ExtractedIngredient(
         canonical_name=canonical,
         raw_text=cleaned,
         quantity=quantity,
         unit=unit,
-        staple=canonical in staples,
+        staple=is_staple_name(canonical),
     )
 
 
@@ -1651,6 +1989,20 @@ async def process_cookbook(cookbook_id: str) -> None:
                         total = (extracted_recipe.prep_minutes or 0) + (
                             extracted_recipe.cook_minutes or 0
                         )
+                    ingredient_names = [
+                        item.canonical_name for item in extracted_recipe.ingredients
+                    ]
+                    ingredient_categories = [
+                        item.category for item in extracted_recipe.ingredients
+                    ]
+                    tagging = await assign_recipe_tags(
+                        title=extracted_recipe.title,
+                        cuisine=extracted_recipe.cuisine,
+                        tags=list(extracted_recipe.tags or []),
+                        ingredient_names=ingredient_names,
+                        ingredient_categories=ingredient_categories,
+                        steps=list(extracted_recipe.steps or []),
+                    )
                     recipe = Recipe(
                         cookbook_id=cookbook.id,
                         title=extracted_recipe.title,
@@ -1662,8 +2014,11 @@ async def process_cookbook(cookbook_id: str) -> None:
                         protein_grams=extracted_recipe.protein_grams,
                         carbs_grams=extracted_recipe.carbs_grams,
                         fat_grams=extracted_recipe.fat_grams,
-                        cuisine=extracted_recipe.cuisine,
-                        tags=extracted_recipe.tags,
+                        cuisine=tagging.cuisine or extracted_recipe.cuisine,
+                        rating=extracted_recipe.rating,
+                        rating_count=extracted_recipe.rating_count,
+                        tags=tagging.tags or list(extracted_recipe.tags or []),
+                        tag_source=tagging.tag_source,
                         steps=extracted_recipe.steps,
                         source_page=extracted_recipe.source_page,
                         parse_warnings=extracted_recipe.parse_warnings,

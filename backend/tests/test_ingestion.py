@@ -236,8 +236,12 @@ def test_parse_servings_ignores_volume_yields() -> None:
     assert parse_servings("For 6 servings") == Decimal("6")
     assert parse_servings("For 6 to 12 servings") == Decimal("9")
     assert parse_servings("For 28 canapés") == Decimal("28")
+    assert parse_servings("Serves 4 to 6") == Decimal("5")
+    assert parse_servings("Serves 4") == Decimal("4")
+    assert parse_servings("Makes 12") == Decimal("12")
     assert parse_servings("1 1/2 to 2 quarts") is None
     assert parse_servings("About 1 2/3 cups medium-thick béchamel") is None
+    assert parse_servings("Makes 3/4 cup") is None
 
 
 def _write_knopf_style_epub(path: Path) -> None:
@@ -493,6 +497,160 @@ HAZAN_EPUB = Path(
     " Marcella Hazan - Essentials of Classic Italian Cooking _ A Cookbook "
     "(2011, Knopf Doubleday Publishing Group) - libgen.li.epub"
 )
+
+SFAH_EPUB = Path(
+    "/Users/zizizink/Library/Mobile Documents/com~apple~CloudDocs/Downloads/"
+    " Nosrat, Samin - Salt, Fat, Acid, Heat_ Mastering the Elements of Good "
+    "Cooking (2017, Simon & Schuster) - libgen.li.epub"
+)
+
+
+def _write_simon_schuster_style_epub(path: Path) -> None:
+    book = epub.EpubBook()
+    book.set_identifier("ss-style-test")
+    book.set_title("Simon Schuster Style Cookbook")
+    book.set_language("en")
+    chapter = epub.EpubHtml(title="Recipes", file_name="recipes.xhtml", lang="en")
+    chapter.content = """
+    <html><body>
+      <h2 class="h2rec">Persian-ish Rice</h2>
+      <p class="right2">Serves 4 to 6</p>
+      <p class="noindent">Every Persian has a special relationship with rice.</p>
+      <p class="item1">2 cups basmati rice</p>
+      <p class="item">Salt</p>
+      <p class="item">3 tablespoons plain yogurt</p>
+      <p class="itemb">3 tablespoons butter</p>
+      <p class="noindent">Fill a large stockpot with water and bring it to a boil.</p>
+      <p class="indent">Cook the rice until al dente, then drain.</p>
+      <h5 class="h5">Variations</h5>
+      <p class="bull1">• To make Saffron Rice, add saffron tea.</p>
+      <h2 class="h2rec">Basic Salsa Verde</h2>
+      <p class="right2">Makes 3/4 cup</p>
+      <p class="item1">3 tablespoons finely diced shallot</p>
+      <p class="item">3 tablespoons red wine vinegar</p>
+      <p class="itemb">1/4 cup extra-virgin olive oil</p>
+      <p class="noindent">Combine the shallot and vinegar and let sit for 15 minutes.</p>
+    </body></html>
+    """
+    book.add_item(chapter)
+    book.toc = [chapter]
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = ["nav", chapter]
+    epub.write_epub(str(path), book)
+
+
+def _write_structural_list_epub(path: Path) -> None:
+    book = epub.EpubBook()
+    book.set_identifier("structural-list-test")
+    book.set_title("Generic List Cookbook")
+    book.set_language("en")
+    chapter = epub.EpubHtml(title="Pasta", file_name="pasta.xhtml", lang="en")
+    chapter.content = """
+    <html><body>
+      <h1>Tomato Pasta</h1>
+      <p>Serves 4</p>
+      <h2>Ingredients</h2>
+      <ul>
+        <li>2 cups tomatoes, chopped</li>
+        <li>1/2 tsp salt</li>
+        <li>2 tablespoons olive oil</li>
+      </ul>
+      <h2>Instructions</h2>
+      <ol>
+        <li>Simmer the tomatoes.</li>
+        <li>Season and serve.</li>
+      </ol>
+      <h1>Garlic Toast</h1>
+      <h2>Ingredients</h2>
+      <ul>
+        <li>2 slices bread</li>
+        <li>1 tbsp butter</li>
+      </ul>
+      <h2>Method</h2>
+      <ol>
+        <li>Toast the bread.</li>
+        <li>Spread butter.</li>
+      </ol>
+    </body></html>
+    """
+    book.add_item(chapter)
+    book.toc = [chapter]
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = ["nav", chapter]
+    epub.write_epub(str(path), book)
+
+
+def test_simon_schuster_profile_skips_headnotes_and_variations(tmp_path: Path) -> None:
+    epub_path = tmp_path / "ss.epub"
+    _write_simon_schuster_style_epub(epub_path)
+    recipes = extract_structured_epub_recipes(epub_path)
+    assert recipes is not None
+    by_title = {recipe.title: recipe for recipe in recipes}
+    assert set(by_title) == {"Persian-ish Rice", "Basic Salsa Verde"}
+    rice = by_title["Persian-ish Rice"]
+    assert rice.servings == Decimal("5")
+    assert [item.canonical_name for item in rice.ingredients][:2] == [
+        "basmati rice",
+        "salt",
+    ]
+    assert rice.steps
+    assert "Every Persian has a special relationship with rice." not in " ".join(
+        rice.steps
+    )
+    assert not any("Saffron" in recipe.title for recipe in recipes)
+    salsa = by_title["Basic Salsa Verde"]
+    assert salsa.servings is None  # volume yield ignored
+    assert len(salsa.ingredients) >= 3
+    assert salsa.steps
+
+
+def test_structural_profile_recovers_list_recipes_without_publisher_classes(
+    tmp_path: Path,
+) -> None:
+    epub_path = tmp_path / "structural.epub"
+    _write_structural_list_epub(epub_path)
+    recipes = extract_structured_epub_recipes(epub_path)
+    assert recipes is not None
+    by_title = {recipe.title: recipe for recipe in recipes}
+    assert set(by_title) >= {"Tomato Pasta", "Garlic Toast"}
+    pasta = by_title["Tomato Pasta"]
+    assert pasta.servings == Decimal("4")
+    assert len(pasta.ingredients) >= 3
+    assert pasta.steps == ["Simmer the tomatoes.", "Season and serve."]
+    toast = by_title["Garlic Toast"]
+    assert [item.canonical_name for item in toast.ingredients] == ["bread", "butter"]
+    assert toast.steps == ["Toast the bread.", "Spread butter."]
+
+
+def test_knopf_profile_still_wins_over_structural_lookalikes(tmp_path: Path) -> None:
+    """Knopf markup must take the exclusive cascade path even if lists exist."""
+    epub_path = tmp_path / "knopf.epub"
+    _write_knopf_style_epub(epub_path)
+    recipes = extract_structured_epub_recipes(epub_path)
+    assert recipes is not None
+    titles = {recipe.title for recipe in recipes}
+    assert "Crostini Bianchi" in titles
+    assert "Bruschetta — Basic Bruschetta" in titles
+
+
+@pytest.mark.skipif(not SFAH_EPUB.is_file(), reason="SFAH EPUB not available locally")
+def test_sfah_epub_simon_schuster_profile_recovers_recipes() -> None:
+    recipes = extract_structured_epub_recipes(SFAH_EPUB)
+    assert recipes is not None
+    assert len(recipes) >= 90
+    by_title = {recipe.title: recipe for recipe in recipes}
+    rice = by_title["Persian-ish Rice"]
+    assert rice.servings == Decimal("5")
+    assert any("rice" in item.canonical_name for item in rice.ingredients)
+    assert rice.steps
+    assert "Every Persian has a special relationship with rice" not in " ".join(
+        rice.steps
+    )
+    salsa = by_title["Basic Salsa Verde"]
+    assert len(salsa.ingredients) >= 3
+    assert all(recipe.ingredients for recipe in recipes)
 
 
 @pytest.mark.skipif(not HAZAN_EPUB.is_file(), reason="Hazan EPUB not available locally")

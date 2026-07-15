@@ -243,3 +243,182 @@ async def test_or_alternate_group_uses_any_matching(client: AsyncClient) -> None
     assert after.status_code == 200
     assert after.json()["missing_count"] == 0
     assert after.json()["ingredients"][0]["match_status"] == "available"
+
+
+@pytest.mark.asyncio
+async def test_unitless_carrot_matches_pantry_weight(client: AsyncClient) -> None:
+    registration = await client.post(
+        "/api/v1/auth/register",
+        json={"email": "carrot@example.com", "password": "password-123"},
+    )
+    headers = {"Authorization": f"Bearer {registration.json()['access_token']}"}
+
+    async with SessionLocal() as db:
+        user = await db.scalar(select(User).where(User.email == "carrot@example.com"))
+        cookbook = Cookbook(
+            user_id=user.id,
+            title="Carrot Book",
+            original_filename="carrot.pdf",
+            content_type="application/pdf",
+            storage_path="/tmp/carrot.pdf",
+        )
+        carrot = Ingredient(name="carrot")
+        db.add_all([cookbook, carrot])
+        await db.flush()
+        carrot.canonical_id = carrot.id
+        recipe = Recipe(cookbook_id=cookbook.id, title="Simple Carrot")
+        db.add(recipe)
+        await db.flush()
+        db.add(
+            RecipeIngredient(
+                recipe_id=recipe.id,
+                ingredient_id=carrot.id,
+                quantity=1,
+                unit=None,
+                raw_text="1 carrot",
+                position=0,
+            )
+        )
+        await db.commit()
+        carrot_id = carrot.id
+        recipe_id = recipe.id
+
+    pantry = await client.post(
+        "/api/v1/pantry",
+        headers=headers,
+        json={"ingredient_id": str(carrot_id), "quantity": 0.7, "unit": "lbs"},
+    )
+    assert pantry.status_code == 201
+
+    detail = await client.get(f"/api/v1/recipes/{recipe_id}", headers=headers)
+    assert detail.status_code == 200
+    assert detail.json()["missing_count"] == 0
+    assert detail.json()["ingredients"][0]["match_status"] == "available"
+
+
+@pytest.mark.asyncio
+async def test_lemon_zest_matches_pantry_lemon(client: AsyncClient) -> None:
+    registration = await client.post(
+        "/api/v1/auth/register",
+        json={"email": "zest@example.com", "password": "password-123"},
+    )
+    headers = {"Authorization": f"Bearer {registration.json()['access_token']}"}
+
+    async with SessionLocal() as db:
+        user = await db.scalar(select(User).where(User.email == "zest@example.com"))
+        cookbook = Cookbook(
+            user_id=user.id,
+            title="Zest Book",
+            original_filename="zest.pdf",
+            content_type="application/pdf",
+            storage_path="/tmp/zest.pdf",
+        )
+        zest = Ingredient(name="lemon zest")
+        lemon = Ingredient(name="lemon")
+        db.add_all([cookbook, zest, lemon])
+        await db.flush()
+        zest.canonical_id = zest.id
+        lemon.canonical_id = lemon.id
+        recipe = Recipe(cookbook_id=cookbook.id, title="Zesty Pasta")
+        db.add(recipe)
+        await db.flush()
+        db.add(
+            RecipeIngredient(
+                recipe_id=recipe.id,
+                ingredient_id=zest.id,
+                quantity=1,
+                unit="tsp",
+                raw_text="1 teaspoon lemon zest",
+                position=0,
+            )
+        )
+        await db.commit()
+        lemon_id = lemon.id
+        recipe_id = recipe.id
+
+    before = await client.get(f"/api/v1/recipes/{recipe_id}", headers=headers)
+    assert before.status_code == 200
+    assert before.json()["missing_count"] == 1
+
+    pantry = await client.post(
+        "/api/v1/pantry",
+        headers=headers,
+        json={"ingredient_id": str(lemon_id), "quantity": 2, "unit": "pieces"},
+    )
+    assert pantry.status_code == 201
+
+    after = await client.get(f"/api/v1/recipes/{recipe_id}", headers=headers)
+    assert after.status_code == 200
+    assert after.json()["missing_count"] == 0
+    ingredient = after.json()["ingredients"][0]
+    assert ingredient["match_status"] == "available"
+    assert ingredient["matched_via"] == "lemon"
+
+
+@pytest.mark.asyncio
+async def test_water_and_pan_are_treated_as_staples(client: AsyncClient) -> None:
+    from app.services.staples import is_staple_name
+
+    assert is_staple_name("water")
+    assert is_staple_name("large pot")
+    assert is_staple_name("frying pan")
+    assert not is_staple_name("carrots")
+
+    registration = await client.post(
+        "/api/v1/auth/register",
+        json={"email": "staple2@example.com", "password": "password-123"},
+    )
+    headers = {"Authorization": f"Bearer {registration.json()['access_token']}"}
+
+    async with SessionLocal() as db:
+        user = await db.scalar(select(User).where(User.email == "staple2@example.com"))
+        cookbook = Cookbook(
+            user_id=user.id,
+            title="Staple Book",
+            original_filename="staple.pdf",
+            content_type="application/pdf",
+            storage_path="/tmp/staple.pdf",
+        )
+        water = Ingredient(name="water", staple=True)
+        pot = Ingredient(name="large pot", staple=True)
+        onion = Ingredient(name="onion", staple=False)
+        db.add_all([cookbook, water, pot, onion])
+        await db.flush()
+        for item in (water, pot, onion):
+            item.canonical_id = item.id
+        recipe = Recipe(cookbook_id=cookbook.id, title="Boil Onion")
+        db.add(recipe)
+        await db.flush()
+        db.add_all(
+            [
+                RecipeIngredient(
+                    recipe_id=recipe.id,
+                    ingredient_id=water.id,
+                    raw_text="water",
+                    position=0,
+                ),
+                RecipeIngredient(
+                    recipe_id=recipe.id,
+                    ingredient_id=pot.id,
+                    raw_text="1 large pot",
+                    position=1,
+                ),
+                RecipeIngredient(
+                    recipe_id=recipe.id,
+                    ingredient_id=onion.id,
+                    quantity=1,
+                    raw_text="1 onion",
+                    position=2,
+                ),
+            ]
+        )
+        await db.commit()
+        recipe_id = recipe.id
+
+    detail = await client.get(f"/api/v1/recipes/{recipe_id}", headers=headers)
+    assert detail.status_code == 200
+    assert detail.json()["missing_count"] == 1
+    by_name = {row["name"]: row for row in detail.json()["ingredients"]}
+    assert by_name["water"]["match_status"] == "staple"
+    assert by_name["large pot"]["match_status"] == "staple"
+    assert by_name["onion"]["match_status"] == "missing"
