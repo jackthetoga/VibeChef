@@ -18,3 +18,6 @@ uploads/
 *.sqlite3
 .idea/
 .vscode/
+.coverage
+.coverage.*
+coverage.xml
