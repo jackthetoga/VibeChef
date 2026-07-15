@@ -137,7 +137,10 @@ async def scan_groceries_from_image(
         messages_user = user_content
         if validation_error:
             messages_user = [
-                {"type": "text", "text": f"{prompt}\n\nPrevious output was invalid: {validation_error}"},
+                {
+                    "type": "text",
+                    "text": f"{prompt}\n\nPrevious output was invalid: {validation_error}",
+                },
                 {"type": "image_url", "image_url": {"url": data_url}},
             ]
         try:
@@ -150,7 +153,13 @@ async def scan_groceries_from_image(
                 timeout=90.0,
             )
             return _coerce_items(_parse_json_payload(raw))
-        except (ValidationError, json.JSONDecodeError, InvalidOperation, KeyError, TypeError) as exc:
+        except (
+            ValidationError,
+            json.JSONDecodeError,
+            InvalidOperation,
+            KeyError,
+            TypeError,
+        ) as exc:
             validation_error = str(exc)
             if attempt:
                 logger.exception("Failed to parse grocery scan response")

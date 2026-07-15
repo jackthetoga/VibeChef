@@ -49,3 +49,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Category SVGs are intentionally long inline art/data strings.
+"app/services/recipe_images.py" = ["E501"]

@@ -393,8 +393,8 @@ def _normalize_title(value: str) -> str:
 def _extract_epub_images_by_title(path: Path) -> dict[str, tuple[bytes, str]]:
     """Map normalized recipe titles to (image_bytes, filename) from nearby <img> tags."""
     import ebooklib
-    from ebooklib import epub
     from bs4 import BeautifulSoup
+    from ebooklib import epub
 
     book = epub.read_epub(str(path), options={"ignore_ncx": True})
     items_by_name: dict[str, object] = {}
