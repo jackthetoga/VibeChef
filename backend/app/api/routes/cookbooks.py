@@ -214,7 +214,11 @@ async def upload_cookbook(
     return await enqueue_ingestion(request, background_tasks, db, cookbook)
 
 
-@router.post("/{cookbook_id}/retry", response_model=CookbookOut, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/{cookbook_id}/retry",
+    response_model=CookbookOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def retry_cookbook(
     cookbook_id: uuid.UUID,
     request: Request,
@@ -233,7 +237,8 @@ async def retry_cookbook(
     cookbook.error = None
     await db.commit()
     await db.refresh(cookbook)
-    return await with_recipe_count(db, await enqueue_ingestion(request, background_tasks, db, cookbook))
+    enqueued = await enqueue_ingestion(request, background_tasks, db, cookbook)
+    return await with_recipe_count(db, enqueued)
 
 
 @router.get("/{cookbook_id}/cover")

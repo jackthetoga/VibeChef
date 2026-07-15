@@ -6,7 +6,6 @@ from httpx import AsyncClient
 from app.core.config import settings
 from app.models import UploadStatus
 
-
 TINY_PDF = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 
 
@@ -20,7 +19,9 @@ async def _auth_headers(client: AsyncClient, email: str = "library@example.com")
 
 
 @pytest.mark.asyncio
-async def test_delete_cookbook_removes_it_from_library(client: AsyncClient, tmp_path: Path, monkeypatch) -> None:
+async def test_delete_cookbook_removes_it_from_library(
+    client: AsyncClient, tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setattr(settings, "upload_dir", tmp_path)
     monkeypatch.setattr(settings, "dev_sync_ingestion", False)
     headers = await _auth_headers(client)
@@ -35,9 +36,10 @@ async def test_delete_cookbook_removes_it_from_library(client: AsyncClient, tmp_
     if upload.status_code == 503:
         from uuid import uuid4
 
+        from sqlalchemy import select
+
         from app.db.session import SessionLocal
         from app.models import Cookbook, User
-        from sqlalchemy import select
 
         async with SessionLocal() as db:
             user = await db.scalar(select(User).where(User.email == "library@example.com"))
@@ -79,9 +81,10 @@ async def test_retry_failed_cookbook(client: AsyncClient, tmp_path: Path, monkey
     monkeypatch.setattr(settings, "dev_sync_ingestion", True)
 
     async def fake_process(cookbook_id: str) -> None:
+        from uuid import UUID
+
         from app.db.session import SessionLocal
         from app.models import Cookbook
-        from uuid import UUID
 
         async with SessionLocal() as db:
             cookbook = await db.get(Cookbook, UUID(cookbook_id))
@@ -96,9 +99,10 @@ async def test_retry_failed_cookbook(client: AsyncClient, tmp_path: Path, monkey
 
     from uuid import uuid4
 
+    from sqlalchemy import select
+
     from app.db.session import SessionLocal
     from app.models import Cookbook, User
-    from sqlalchemy import select
 
     async with SessionLocal() as db:
         user = await db.scalar(select(User).where(User.email == "retry@example.com"))
