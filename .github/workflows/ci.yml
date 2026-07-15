@@ -33,8 +33,10 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Lint (ruff)
         run: ruff check app tests
-      - name: Test (pytest, in-memory SQLite)
-        run: pytest
+      - name: Test (pytest, in-memory SQLite) + coverage report
+        # Reporting only for now — no --cov-fail-under. A hard floor is deferred until the
+        # number is trustworthy (a premature floor just invites gaming). See ADR-0005.
+        run: pytest --cov=app --cov-report=term-missing
 
   migrations:
     name: Alembic migrations apply on Postgres
