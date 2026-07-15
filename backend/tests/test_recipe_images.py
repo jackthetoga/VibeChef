@@ -69,7 +69,9 @@ def test_classify_recipe_category(title: str, expected: str) -> None:
     assert classify_recipe_category(title) == expected
 
 
-def test_ensure_category_assets_writes_svgs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ensure_category_assets_writes_svgs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from app.services import recipe_images
 
     monkeypatch.setattr(recipe_images, "CATEGORY_DIR", tmp_path)

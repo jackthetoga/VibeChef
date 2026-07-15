@@ -310,14 +310,17 @@ def test_ingredient_parser_finds_noun_after_comma_separated_descriptors() -> Non
     assert potato.quantity == Decimal("1.5")
     assert potato.unit == "pounds"
     assert demo_ingredient("1 pound fresh, ripe, firm tomatoes").canonical_name == "tomatoes"
-    assert demo_ingredient("7 slices good-quality, firm white toasting bread").canonical_name == "bread"
+    assert (
+        demo_ingredient("7 slices good-quality, firm white toasting bread").canonical_name
+        == "bread"
+    )
     assert demo_ingredient("2 tablespoons chopped parsley").canonical_name == "parsley"
 
 
 def test_canned_tomato_or_alternate_matches_canned_tomatoes_name() -> None:
     """Fresh/canned tomato OR lines must expose a canned-tomatoes alternate for pantry match."""
-    from app.services.ingestion import parse_ingredient_line
     from app.services.canonicalize import heuristic_canonical_name
+    from app.services.ingestion import parse_ingredient_line
 
     raw = (
         "2 pounds fresh, ripe tomatoes, prepared as described on this page or "

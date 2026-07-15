@@ -215,7 +215,10 @@ async def test_pantry_confirm_creates_and_updates_quantities(client: AsyncClient
     body = created.json()
     assert {item["ingredient"]["name"] for item in body["added"]} == {"tomatoes", "milk"}
     assert body["updated"] == []
-    assert Decimal(next(item for item in body["added"] if item["ingredient"]["name"] == "tomatoes")["quantity"]) == Decimal("3")
+    tomatoes = next(
+        item for item in body["added"] if item["ingredient"]["name"] == "tomatoes"
+    )
+    assert Decimal(tomatoes["quantity"]) == Decimal("3")
 
     updated = await client.post(
         "/api/v1/pantry/confirm",

@@ -428,7 +428,8 @@ def _is_quantity_range_or(raw: str) -> bool:
 
 def _looks_like_variety_or(left: str, right: str) -> bool:
     """True for color/variety choices like 'red or green bell peppers'."""
-    color_pattern = "|".join(sorted({"black", "brown", "green", "orange", "purple", "red", "white", "yellow"}))
+    colors = {"black", "brown", "green", "orange", "purple", "red", "white", "yellow"}
+    color_pattern = "|".join(sorted(colors))
     return bool(
         re.search(
             rf"(?i)\b(?:{color_pattern})\b.+\b(?:{color_pattern})\b",
