@@ -17,6 +17,12 @@ from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models import Cookbook, Ingredient, Recipe, RecipeIngredient, UploadStatus
 from app.services.canonicalize import canonicalize_ingredients, resolve_or_alternates
+from app.services.catalog import (
+    find_or_create_catalog_cookbook,
+    recipe_fingerprint,
+    sha256_file,
+    upsert_catalog_recipe,
+)
 from app.services.llm import chat_completion
 from app.services.nutrition import apply_printed_nutrition_metadata
 from app.services.recipe_tagging import assign_recipe_tags
@@ -44,13 +50,9 @@ EPUB_NOISE_NAME_TOKENS = (
 # Knopf / Random House cookbook EPUB CSS conventions (e.g. Marcella Hazan).
 RECIPE_TITLE_CLASSES = frozenset({"rt", "rtaft", "rvh"})
 RECIPE_YIELD_CLASSES = frozenset({"ry", "ry-alt", "rvy"})
-RECIPE_INGREDIENT_CLASSES = frozenset(
-    {"ril", "rilf", "rill", "rils", "rvil", "rvilf", "rvill"}
-)
+RECIPE_INGREDIENT_CLASSES = frozenset({"ril", "rilf", "rill", "rils", "rvil", "rvilf", "rvill"})
 RECIPE_INGREDIENT_HEADER_CLASSES = frozenset({"rilh"})
-RECIPE_STEP_CLASSES = frozenset(
-    {"rp", "rpf", "rps", "rp-alt", "rpf-alt", "rvp", "rvps", "rv"}
-)
+RECIPE_STEP_CLASSES = frozenset({"rp", "rpf", "rps", "rp-alt", "rpf-alt", "rvp", "rvps", "rv"})
 # Variation intro/body prose often carries the only instructions.
 RECIPE_VARIATION_BODY_CLASSES = frozenset({"rvf", "rvhn"})
 
@@ -119,9 +121,7 @@ INGREDIENT_DESCRIPTORS = frozenset(
         "yellow",
     }
 )
-CONTEXT_TITLE_RE = re.compile(
-    r"(?i)^(?:variation\b|the .+ version\b|when \b|alternative\b)"
-)
+CONTEXT_TITLE_RE = re.compile(r"(?i)^(?:variation\b|the .+ version\b|when \b|alternative\b)")
 CONTEXT_REFERENCE_RE = re.compile(
     r"(?i)\b(?:preceding recipe|previous recipe|recipe above|basic recipe|"
     r"same (?:soup|recipe|dish)|as described above|as given above|ingredients "
@@ -192,8 +192,7 @@ class ExtractedIngredient(BaseModel):
                 name = _shorten_canonical_name(name)
         if not name:
             name = (
-                _short_name_from_raw(self.raw_text)
-                or self.raw_text.lower()[:MAX_CANONICAL_CHARS]
+                _short_name_from_raw(self.raw_text) or self.raw_text.lower()[:MAX_CANONICAL_CHARS]
             )
         self.canonical_name = name[:255]
         return self
@@ -392,9 +391,7 @@ def _ingredient_name_from_remainder(remainder: str) -> str:
 def _normalize_known_ingredient_name(name: str) -> str:
     """Collapse pantry-equivalent variants to stable matching names."""
     words = set(re.findall(r"[a-z']+", name.lower()))
-    if ("tomato" in words or "tomatoes" in words) and (
-        "canned" in words or "tinned" in words
-    ):
+    if ("tomato" in words or "tomatoes" in words) and ("canned" in words or "tinned" in words):
         return "canned tomatoes"
     return name
 
@@ -541,9 +538,7 @@ def deduplicate_recipes(recipes: list[ExtractedRecipe]) -> list[ExtractedRecipe]
     return unique
 
 
-async def resolve_ingredient(
-    db: AsyncSession, extracted: ExtractedIngredient
-) -> Ingredient:
+async def resolve_ingredient(db: AsyncSession, extracted: ExtractedIngredient) -> Ingredient:
     from app.services.staples import is_staple_name
 
     name = extracted.canonical_name
@@ -617,10 +612,7 @@ def _is_epub_noise_document(item) -> bool:
     properties = {str(value).lower() for value in (getattr(item, "properties", None) or [])}
     if "nav" in properties:
         return True
-    return any(
-        token in item_id or token in name
-        for token in EPUB_NOISE_NAME_TOKENS
-    )
+    return any(token in item_id or token in name for token in EPUB_NOISE_NAME_TOKENS)
 
 
 def _iter_epub_documents(book):
@@ -677,9 +669,7 @@ def _epub_has_knopf_markup(book) -> bool:
         title_classes=RECIPE_TITLE_CLASSES,
         ingredient_classes=RECIPE_INGREDIENT_CLASSES,
     )
-    return (title_hits >= 5 and ingredient_hits >= 10) or (
-        title_hits >= 3 and ingredient_hits >= 5
-    )
+    return (title_hits >= 5 and ingredient_hits >= 10) or (title_hits >= 3 and ingredient_hits >= 5)
 
 
 def _epub_has_simon_schuster_markup(book) -> bool:
@@ -688,9 +678,7 @@ def _epub_has_simon_schuster_markup(book) -> bool:
         title_classes=SS_TITLE_CLASSES,
         ingredient_classes=SS_INGREDIENT_CLASSES,
     )
-    return (title_hits >= 5 and ingredient_hits >= 10) or (
-        title_hits >= 3 and ingredient_hits >= 5
-    )
+    return (title_hits >= 5 and ingredient_hits >= 10) or (title_hits >= 3 and ingredient_hits >= 5)
 
 
 def _epub_has_recipe_markup(book) -> bool:
@@ -913,9 +901,7 @@ def _flag_title_ingredient_gaps(recipe: ExtractedRecipe) -> list[str]:
     warnings: list[str] = []
     for token in _title_food_tokens(recipe.title):
         if token not in corpus_tokens:
-            warnings.append(
-                f'title mentions "{token}" but no matching ingredient was parsed'
-            )
+            warnings.append(f'title mentions "{token}" but no matching ingredient was parsed')
     return warnings
 
 
@@ -993,9 +979,7 @@ def _finalize_structured_recipe(
     if not title:
         return None
     cleaned_steps = [
-        re.sub(r"^\s*(?:\d+[.)]|[•*-])\s*", "", step).strip()
-        for step in steps
-        if step.strip()
+        re.sub(r"^\s*(?:\d+[.)]|[•*-])\s*", "", step).strip() for step in steps if step.strip()
     ]
     # Variation write-ups often put the full method in prose instead of numbered steps.
     if not cleaned_steps and variation_body:
@@ -1043,11 +1027,9 @@ def _parse_structured_epub_document(content: bytes | str) -> list[ExtractedRecip
             steps=steps,
         )
         if recipe is not None:
-            source_text = " ".join(
-                [line for _, line in ingredient_lines] + variation_body + steps
-            )
-            reference_dependent = (
-                not recipe.ingredients and bool(CONTEXT_REFERENCE_RE.search(source_text))
+            source_text = " ".join([line for _, line in ingredient_lines] + variation_body + steps)
+            reference_dependent = not recipe.ingredients and bool(
+                CONTEXT_REFERENCE_RE.search(source_text)
             )
             context = primary_recipe if current_is_variation else previous_recipe
             if current_is_variation and primary_title:
@@ -1301,10 +1283,7 @@ def _parse_structural_epub_document(content: bytes | str) -> list[ExtractedRecip
 
             if in_ingredient_section or (
                 not saw_explicit_sections
-                and (
-                    next_tag == "li"
-                    or _looks_like_ingredient_line(next_text)
-                )
+                and (next_tag == "li" or _looks_like_ingredient_line(next_text))
             ):
                 # Once steps have started without an Ingredients heading, stop
                 # treating prose as ingredients.
@@ -1577,8 +1556,7 @@ async def expand_ambiguous_or_ingredients(
         return recipes
 
     fallback_names = {
-        " ".join(ingredient.raw_text.split()): ingredient.canonical_name
-        for ingredient in ambiguous
+        " ".join(ingredient.raw_text.split()): ingredient.canonical_name for ingredient in ambiguous
     }
     mapping = await resolve_or_alternates(
         list(fallback_names),
@@ -1978,6 +1956,13 @@ async def process_cookbook(cookbook_id: str) -> None:
                 if cookbook is None:
                     return
                 await db.execute(delete(Recipe).where(Recipe.cookbook_id == cookbook.id))
+                if not cookbook.content_sha256:
+                    cookbook.content_sha256 = sha256_file(path)
+                catalog_cookbook = await find_or_create_catalog_cookbook(
+                    db,
+                    content_sha256=cookbook.content_sha256,
+                    title=cookbook.title,
+                )
                 ingredient_cache: dict[str, Ingredient] = {}
                 raw_hints: dict[str, str] = {}
                 for extracted_recipe in extracted:
@@ -1992,9 +1977,7 @@ async def process_cookbook(cookbook_id: str) -> None:
                     ingredient_names = [
                         item.canonical_name for item in extracted_recipe.ingredients
                     ]
-                    ingredient_categories = [
-                        item.category for item in extracted_recipe.ingredients
-                    ]
+                    ingredient_categories = [item.category for item in extracted_recipe.ingredients]
                     tagging = await assign_recipe_tags(
                         title=extracted_recipe.title,
                         cuisine=extracted_recipe.cuisine,
@@ -2003,8 +1986,25 @@ async def process_cookbook(cookbook_id: str) -> None:
                         ingredient_categories=ingredient_categories,
                         steps=list(extracted_recipe.steps or []),
                     )
+                    fingerprint = recipe_fingerprint(
+                        title=extracted_recipe.title,
+                        ingredient_raw_texts=[
+                            item.raw_text for item in extracted_recipe.ingredients
+                        ],
+                        steps=list(extracted_recipe.steps or []),
+                    )
+                    catalog_recipe_id = None
+                    if fingerprint is not None:
+                        catalog_recipe = await upsert_catalog_recipe(
+                            db,
+                            catalog_cookbook=catalog_cookbook,
+                            fingerprint=fingerprint,
+                            title=extracted_recipe.title,
+                        )
+                        catalog_recipe_id = catalog_recipe.id
                     recipe = Recipe(
                         cookbook_id=cookbook.id,
+                        catalog_recipe_id=catalog_recipe_id,
                         title=extracted_recipe.title,
                         servings=extracted_recipe.servings,
                         prep_minutes=extracted_recipe.prep_minutes,
@@ -2027,9 +2027,7 @@ async def process_cookbook(cookbook_id: str) -> None:
                     db.add(recipe)
                     await db.flush()
                     group_ids: dict[str, uuid.UUID] = {}
-                    for position, extracted_ingredient in enumerate(
-                        extracted_recipe.ingredients
-                    ):
+                    for position, extracted_ingredient in enumerate(extracted_recipe.ingredients):
                         name = extracted_ingredient.canonical_name
                         ingredient = ingredient_cache.get(name)
                         if ingredient is None:

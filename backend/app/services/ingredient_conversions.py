@@ -88,11 +88,12 @@ INGREDIENT_CONVERSIONS = (
     conversion(
         "onions",
         "142",
-        "fresh, diced",
+        "fresh, diced; 1 large onion ≈ 2 cups",
         source=KING_ARTHUR_SOURCE,
         source_url=KING_ARTHUR_URL,
         aliases=("onion", "yellow onion", "red onion", "white onion"),
-        grams_per_item="110",
+        # Cooking yield: one large onion ≈ 2 cups diced (142 g/cup → 284 g/item).
+        grams_per_item="284",
     ),
     conversion(
         "all-purpose flour",

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useParams } from '@tanstack/react-router'
 import {
@@ -12,10 +12,11 @@ import {
   Gauge,
   Refrigerator,
   Sparkles,
+  Star,
   UsersRound,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { pantryApi, recipesApi } from '../lib/api/client'
+import { pantryApi, recipesApi, reviewsApi } from '../lib/api/client'
 import type { Recipe, RecipeCookItem, RecipeIngredient, RecipeTagUpdate } from '../lib/api/types'
 import { cn, formatMinutes } from '../lib/utils'
 import { formatQuantity, UNIT_GROUPS } from '../lib/units'
@@ -163,12 +164,92 @@ export function RecipeDetailPage() {
     food_groups: [] as string[],
     dish_tags: [] as string[],
   })
+  const [reviewRating, setReviewRating] = useState(5)
+  const [reviewBody, setReviewBody] = useState('')
+  const [reviewError, setReviewError] = useState('')
 
   const recipe = useQuery({
     queryKey: ['recipe', recipeId],
     queryFn: () => recipesApi.get(recipeId || ''),
     enabled: Boolean(recipeId),
   })
+
+  const catalogRecipeId = recipe.data?.catalog_recipe_id
+
+  const reviews = useQuery({
+    queryKey: ['reviews', catalogRecipeId],
+    queryFn: () => reviewsApi.list(catalogRecipeId || ''),
+    enabled: Boolean(catalogRecipeId),
+  })
+
+  const myReview = useQuery({
+    queryKey: ['reviews', catalogRecipeId, 'me'],
+    queryFn: () => reviewsApi.mine(catalogRecipeId || ''),
+    enabled: Boolean(catalogRecipeId),
+  })
+
+  const invalidateReviews = () => {
+    void client.invalidateQueries({ queryKey: ['reviews', catalogRecipeId] })
+    void client.invalidateQueries({ queryKey: ['recipe', recipeId] })
+    void client.invalidateQueries({ queryKey: ['recipes'] })
+  }
+
+  const saveReview = useMutation({
+    mutationFn: async () => {
+      if (!catalogRecipeId) throw new Error('This recipe is not linked to the shared catalog yet')
+      const input = { rating: reviewRating, body: reviewBody.trim() || null }
+      if (myReview.data) return reviewsApi.updateMine(catalogRecipeId, input)
+      return reviewsApi.create(catalogRecipeId, input)
+    },
+    onSuccess: () => {
+      setReviewError('')
+      toast.success(myReview.data ? 'Review updated' : 'Review posted')
+      invalidateReviews()
+    },
+    onError: (error) => {
+      setReviewError(error.message)
+      toast.error(error.message)
+    },
+  })
+
+  const deleteReview = useMutation({
+    mutationFn: () => reviewsApi.deleteMine(catalogRecipeId || ''),
+    onSuccess: () => {
+      setReviewBody('')
+      setReviewRating(5)
+      toast.success('Review deleted')
+      invalidateReviews()
+    },
+    onError: (error) => toast.error(error.message),
+  })
+
+  const uploadReviewPhoto = useMutation({
+    mutationFn: (file: File) => reviewsApi.addPhoto(catalogRecipeId || '', file),
+    onSuccess: () => {
+      toast.success('Photo added')
+      invalidateReviews()
+    },
+    onError: (error) => toast.error(error.message),
+  })
+
+  const removeReviewPhoto = useMutation({
+    mutationFn: (photoId: string) => reviewsApi.deletePhoto(catalogRecipeId || '', photoId),
+    onSuccess: () => {
+      toast.success('Photo removed')
+      invalidateReviews()
+    },
+    onError: (error) => toast.error(error.message),
+  })
+
+  useEffect(() => {
+    if (myReview.data) {
+      setReviewRating(myReview.data.rating)
+      setReviewBody(myReview.data.body || '')
+    } else if (myReview.isSuccess) {
+      setReviewRating(5)
+      setReviewBody('')
+    }
+  }, [myReview.data, myReview.isSuccess])
 
   const invalidateAfterPantryChange = () => {
     void client.invalidateQueries({ queryKey: ['pantry'] })
@@ -374,6 +455,23 @@ export function RecipeDetailPage() {
               {data.source_page ? ` · p. ${data.source_page}` : ''}
             </p>
           )}
+          <div className="mt-3 flex flex-wrap gap-3 text-sm text-muted">
+            {data.catalog_recipe_id && (data.user_rating_count ?? 0) > 0 && (
+              <span className="inline-flex items-center gap-1 font-semibold text-ink">
+                <Star className="size-4 fill-terracotta text-terracotta" />
+                {Number(data.user_rating_avg).toFixed(1)} community
+                <span className="font-normal text-muted">
+                  ({data.user_rating_count} review{(data.user_rating_count || 0) === 1 ? '' : 's'})
+                </span>
+              </span>
+            )}
+            {data.rating != null && (
+              <span className="inline-flex items-center gap-1">
+                Source rating {Number(data.rating).toFixed(1)}
+                {data.rating_count != null ? ` · ${data.rating_count}` : ''}
+              </span>
+            )}
+          </div>
           {data.description && <p className="mt-4 text-base leading-relaxed text-muted">{data.description}</p>}
           <div className="mt-7 grid grid-cols-3 divide-x divide-line rounded-2xl bg-sand p-4 text-center">
             <div><Clock3 className="mx-auto mb-1 size-5 text-sage-dark" /><b className="text-sm text-ink">{formatMinutes(time)}</b><span className="block text-[11px] text-muted">Total time</span></div>
@@ -569,6 +667,161 @@ export function RecipeDetailPage() {
           )}
         </Card>
       </div>
+
+      {data.catalog_recipe_id ? (
+        <Card className="mt-7 p-5 sm:p-8">
+          <h2 className="font-display text-2xl font-bold text-ink">Community reviews</h2>
+          <p className="mt-1 text-sm text-muted">
+            Reviews are shared with everyone who has this same cookbook content. Source ratings stay separate.
+          </p>
+
+          <form
+            className="mt-6 grid gap-4 rounded-2xl border border-line bg-sand/40 p-4"
+            onSubmit={(event) => {
+              event.preventDefault()
+              if (reviewRating < 1 || reviewRating > 5) {
+                setReviewError('Choose a rating from 1 to 5 stars')
+                return
+              }
+              setReviewError('')
+              saveReview.mutate()
+            }}
+          >
+            <Field label={myReview.data ? 'Update your review' : 'Write a review'}>
+              <div className="flex gap-1">
+                {[1, 2, 3, 4, 5].map((value) => (
+                  <button
+                    key={value}
+                    type="button"
+                    aria-label={`${value} star${value === 1 ? '' : 's'}`}
+                    className="rounded-md p-1 text-terracotta transition hover:bg-white"
+                    onClick={() => setReviewRating(value)}
+                  >
+                    <Star
+                      className={cn(
+                        'size-6',
+                        value <= reviewRating ? 'fill-terracotta text-terracotta' : 'text-line',
+                      )}
+                    />
+                  </button>
+                ))}
+              </div>
+            </Field>
+            <Field label="Comments" hint="Optional">
+              <textarea
+                className="min-h-24 w-full rounded-xl border border-line bg-white px-3 py-2 text-sm font-normal text-ink outline-none ring-sage/30 focus:ring-2"
+                value={reviewBody}
+                onChange={(event) => setReviewBody(event.target.value)}
+                maxLength={5000}
+                placeholder="How did it turn out?"
+              />
+            </Field>
+            {myReview.data ? (
+              <div className="flex flex-wrap gap-3">
+                {(myReview.data.photos || []).map((photo) => (
+                  <div key={photo.id} className="relative">
+                    <img
+                      src={photo.url}
+                      alt="Your review"
+                      className="size-20 rounded-xl object-cover"
+                    />
+                    <button
+                      type="button"
+                      className="absolute -right-1 -top-1 rounded-full bg-ink px-1.5 text-xs text-white"
+                      onClick={() => removeReviewPhoto.mutate(photo.id)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+                {(myReview.data.photos?.length || 0) < 5 && (
+                  <label className="grid size-20 cursor-pointer place-items-center rounded-xl border border-dashed border-line bg-white text-xs font-semibold text-muted">
+                    Add photo
+                    <input
+                      type="file"
+                      accept="image/jpeg,image/png,image/webp"
+                      className="hidden"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0]
+                        if (file) uploadReviewPhoto.mutate(file)
+                        event.target.value = ''
+                      }}
+                    />
+                  </label>
+                )}
+              </div>
+            ) : (
+              <p className="text-xs text-muted">Post your review first, then you can add photos.</p>
+            )}
+            {reviewError && <p className="text-sm text-terracotta">{reviewError}</p>}
+            <div className="flex flex-wrap gap-2">
+              <Button type="submit" disabled={saveReview.isPending}>
+                {saveReview.isPending ? 'Saving…' : myReview.data ? 'Update review' : 'Post review'}
+              </Button>
+              {myReview.data && (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={deleteReview.isPending}
+                  onClick={() => deleteReview.mutate()}
+                >
+                  Delete review
+                </Button>
+              )}
+            </div>
+          </form>
+
+          <div className="mt-8 grid gap-4">
+            {reviews.isLoading && <Skeleton className="h-24 w-full" />}
+            {(reviews.data?.items || []).length === 0 && !reviews.isLoading && (
+              <p className="text-sm text-muted">No community reviews yet.</p>
+            )}
+            {(reviews.data?.items || []).map((review) => (
+              <div key={review.id} className="rounded-2xl border border-line bg-white p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <div className="flex">
+                      {[1, 2, 3, 4, 5].map((value) => (
+                        <Star
+                          key={value}
+                          className={cn(
+                            'size-4',
+                            value <= review.rating ? 'fill-terracotta text-terracotta' : 'text-line',
+                          )}
+                        />
+                      ))}
+                    </div>
+                    <b className="text-sm text-ink">{review.display_name || 'Cook'}</b>
+                  </div>
+                  <span className="text-xs text-muted">
+                    {new Date(review.created_at).toLocaleDateString()}
+                  </span>
+                </div>
+                {review.body && <p className="mt-2 text-sm leading-relaxed text-ink">{review.body}</p>}
+                {review.photos?.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {review.photos.map((photo) => (
+                      <img
+                        key={photo.id}
+                        src={photo.url}
+                        alt=""
+                        className="size-24 rounded-xl object-cover"
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </Card>
+      ) : (
+        <Card className="mt-7 p-5 sm:p-8">
+          <h2 className="font-display text-2xl font-bold text-ink">Community reviews</h2>
+          <p className="mt-2 text-sm text-muted">
+            Reviews will be available once this recipe is linked to the shared catalog.
+          </p>
+        </Card>
+      )}
 
       <Dialog
         open={cookOpen}

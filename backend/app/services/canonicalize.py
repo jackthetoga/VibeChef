@@ -30,15 +30,39 @@ IGNORED_CANDIDATE_TOKENS = {
 COLOR_WORDS = frozenset(
     {"black", "brown", "green", "orange", "purple", "red", "white", "yellow"}
 )
+# Yellow/white cooking onions interchange with plain onion; red onion does not.
+COOKING_ONION_NAMES = frozenset(
+    {
+        "onion",
+        "onions",
+        "yellow onion",
+        "yellow onions",
+        "white onion",
+        "white onions",
+    }
+)
+# Generic sausage covers plain pork sausage, not flavored varieties.
+SAUSAGE_NAMES = frozenset({"sausage", "sausages", "pork sausage", "pork sausages"})
 
 
 def normalize_ingredient_name(value: object) -> str:
     return " ".join(str(value or "").lower().strip().split())
 
 
+def ingredient_match_key(name: str) -> str:
+    """Stable key for pantry↔recipe identity when canonical_id links are missing."""
+    normalized = normalize_ingredient_name(name)
+    if normalized in COOKING_ONION_NAMES:
+        return "onion"
+    if normalized in SAUSAGE_NAMES:
+        return "sausage"
+    return normalized
+
+
 def heuristic_canonical_name(name: str) -> str | None:
     """Deterministic mappings for pantry-critical variants the LLM may miss."""
-    words = set(re.findall(r"[a-z']+", normalize_ingredient_name(name)))
+    normalized = normalize_ingredient_name(name)
+    words = set(re.findall(r"[a-z']+", normalized))
     if ("tomato" in words or "tomatoes" in words) and (
         "canned" in words or "tinned" in words
     ):
@@ -49,6 +73,9 @@ def heuristic_canonical_name(name: str) -> str | None:
     parent = parent_food_name(name)
     if parent is not None:
         return parent
+    match_key = ingredient_match_key(normalized)
+    if match_key != normalized:
+        return match_key
     return None
 
 
@@ -106,6 +133,10 @@ def _canonicalization_prompt(
         "is not milk, almond butter is not butter, and garlic powder is not garlic.\n"
         "- Distinct oils, flours, dairy products, meats, and produce remain distinct unless one "
         "input is merely a variety or grade of the same ingredient.\n"
+        "- Yellow onion and white onion canonicalize to onion. Red onion stays red onion "
+        "(not interchangeable with plain/yellow/white onion for matching).\n"
+        "- Pork sausage canonicalizes to sausage. Keep flavored sausages distinct "
+        "(italian sausage, breakfast sausage, chorizo, etc.).\n"
         "- When a source line offers true substitutes (fresh tomatoes or canned tomatoes), "
         "canonicalize the input name itself; do not invent a second option here.\n"
         "- Canned/tinned tomato products (including plum, diced, crushed, imported Italian) "
@@ -120,7 +151,8 @@ def _canonicalization_prompt(
         "Examples:\n"
         '{"coconut milk":"coconut milk","extra virgin olive oil":"olive oil",'
         '"vegetable oil":"vegetable oil","chopped parsley":"parsley",'
-        '"canned imported italian plum tomatoes":"canned tomatoes"}\n\n'
+        '"canned imported italian plum tomatoes":"canned tomatoes",'
+        '"yellow onion":"onion","pork sausage":"sausage","red onion":"red onion"}\n\n'
         f"EXISTING CANONICALS:\n{json.dumps(candidates, ensure_ascii=False)}\n\n"
         f"INPUTS:\n{numbered}"
     )

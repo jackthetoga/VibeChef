@@ -1,5 +1,7 @@
 from app.models.entities import (
     Base,
+    CatalogCookbook,
+    CatalogRecipe,
     Cookbook,
     FoodNutritionCache,
     ImageSource,
@@ -10,12 +12,16 @@ from app.models.entities import (
     Recipe,
     RecipeIngredient,
     RefreshToken,
+    Review,
+    ReviewPhoto,
     UploadStatus,
     User,
 )
 
 __all__ = [
     "Base",
+    "CatalogCookbook",
+    "CatalogRecipe",
     "Cookbook",
     "FoodNutritionCache",
     "ImageSource",
@@ -26,6 +32,8 @@ __all__ = [
     "Recipe",
     "RecipeIngredient",
     "RefreshToken",
+    "Review",
+    "ReviewPhoto",
     "UploadStatus",
     "User",
 ]

@@ -44,9 +44,7 @@ async def test_common_ingredients_can_be_added_in_bulk_without_duplicates(
     assert first.status_code == 201
     assert len(first.json()["added"]) == 2
     assert first.json()["skipped_existing"] == []
-    added_by_name = {
-        item["ingredient"]["name"]: item for item in first.json()["added"]
-    }
+    added_by_name = {item["ingredient"]["name"]: item for item in first.json()["added"]}
     assert Decimal(added_by_name["olive oil"]["quantity"]) == Decimal("500")
     assert added_by_name["olive oil"]["unit"] == "ml"
     assert Decimal(added_by_name["salt"]["quantity"]) == Decimal("250")
@@ -63,8 +61,7 @@ async def test_common_ingredients_can_be_added_in_bulk_without_duplicates(
 
     pantry = await client.get("/api/v1/pantry", headers=headers)
     categories = {
-        item["ingredient"]["name"]: item["ingredient"]["category"]
-        for item in pantry.json()
+        item["ingredient"]["name"]: item["ingredient"]["category"] for item in pantry.json()
     }
     assert categories == {
         "black pepper": "Spices & Seasonings",
@@ -130,14 +127,7 @@ async def test_pantry_from_text_adds_updates_and_removes(
     response = await client.post(
         "/api/v1/pantry/from-text",
         headers=headers,
-        json={
-            "text": (
-                "Used 2 eggs\n"
-                "Bought 3 tomatoes\n"
-                "Finished the spinach\n"
-                "+ 1 cup milk"
-            )
-        },
+        json={"text": ("Used 2 eggs\nBought 3 tomatoes\nFinished the spinach\n+ 1 cup milk")},
     )
     assert response.status_code == 200
     body = response.json()
@@ -258,6 +248,66 @@ async def test_pantry_scan_rejects_non_images(
         files={"file": ("notes.txt", b"not an image", "text/plain")},
     )
     assert response.status_code == 415
+
+
+def _tiny_heic() -> bytes:
+    from io import BytesIO
+
+    import pillow_heif
+    from PIL import Image
+
+    pillow_heif.register_heif_opener()
+    image = Image.new("RGB", (8, 8), color=(255, 0, 0))
+    buffer = BytesIO()
+    image.save(buffer, format="HEIF")
+    return buffer.getvalue()
+
+
+def test_sniff_and_normalize_heic_images() -> None:
+    from app.services.pantry_vision import normalize_pantry_image, sniff_image_media_type
+
+    heic = _tiny_heic()
+    assert sniff_image_media_type(heic, "image/heic", "photo.heic") == "image/heic"
+    assert sniff_image_media_type(heic, "", "IMG_0001.HEIC") == "image/heic"
+    assert sniff_image_media_type(heic, "application/octet-stream", "scan.heif") == "image/heif"
+
+    content, media_type = normalize_pantry_image(heic, "image/heic", "photo.heic")
+    assert media_type == "image/jpeg"
+    assert content.startswith(b"\xff\xd8\xff")
+
+
+@pytest.mark.asyncio
+async def test_pantry_scan_accepts_heic(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "openai_api_key", "")
+    headers = await auth_headers(client)
+    response = await client.post(
+        "/api/v1/pantry/scan",
+        headers=headers,
+        files={"file": ("groceries.heic", _tiny_heic(), "image/heic")},
+    )
+    assert response.status_code == 200
+    assert {item["name"] for item in response.json()["items"]} >= {"tomatoes", "milk", "eggs"}
+
+
+@pytest.mark.asyncio
+async def test_pantry_scan_receipt_accepts_heic(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "openai_api_key", "")
+    headers = await auth_headers(client)
+    response = await client.post(
+        "/api/v1/pantry/scan-receipt",
+        headers=headers,
+        files={"file": ("receipt.HEIC", _tiny_heic(), "")},
+    )
+    assert response.status_code == 200
+    assert {item["name"] for item in response.json()["items"]} >= {"milk", "eggs", "bread"}
 
 
 @pytest.mark.asyncio
@@ -394,4 +444,3 @@ async def test_autocomplete_returns_ranked_canonical_roots_only(
     )
     assert specific.status_code == 200
     assert [item["name"] for item in specific.json()] == ["pancetta"]
-

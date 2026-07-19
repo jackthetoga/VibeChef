@@ -493,11 +493,15 @@ async def assign_images_for_cookbook(cookbook_id: str, cookbook_path: Path) -> N
                     recipe.id,
                     exc,
                 )
-                apply_assignment(recipe, corpus_assignment(recipe.title, recipe.cuisine, list(recipe.tags or [])))
+                apply_assignment(
+                    recipe, corpus_assignment(recipe.title, recipe.cuisine, list(recipe.tags or []))
+                )
         await db.commit()
 
 
-async def backfill_recipe_images(*, cookbook_id: str | None = None, force: bool = False) -> dict[str, int]:
+async def backfill_recipe_images(
+    *, cookbook_id: str | None = None, force: bool = False
+) -> dict[str, int]:
     """Reassign images: preserve extracted unless force; clear legacy category; try corpus."""
     from app.db.session import SessionLocal
     from app.models import Cookbook, Recipe

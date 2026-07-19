@@ -182,7 +182,7 @@ class MyPlateClient:
         self._client: httpx.AsyncClient | None = None
         self._success_streak = 0
 
-    async def __aenter__(self) -> "MyPlateClient":
+    async def __aenter__(self) -> MyPlateClient:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._client = httpx.AsyncClient(
             timeout=self.timeout,

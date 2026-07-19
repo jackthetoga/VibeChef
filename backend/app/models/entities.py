@@ -85,6 +85,52 @@ class User(UUIDTimestampMixin, Base):
     refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    reviews: Mapped[list["Review"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class CatalogCookbook(UUIDTimestampMixin, Base):
+    """Shared cookbook identity keyed by file content hash (not filename)."""
+
+    __tablename__ = "catalog_cookbooks"
+    __table_args__ = (Index("ix_catalog_cookbooks_content_sha256", "content_sha256", unique=True),)
+
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str | None] = mapped_column(String(255))
+
+    recipes: Mapped[list["CatalogRecipe"]] = relationship(
+        back_populates="catalog_cookbook", cascade="all, delete-orphan"
+    )
+
+
+class CatalogRecipe(UUIDTimestampMixin, Base):
+    """Shared recipe identity within a content-addressed cookbook."""
+
+    __tablename__ = "catalog_recipes"
+    __table_args__ = (
+        UniqueConstraint(
+            "catalog_cookbook_id",
+            "recipe_fingerprint",
+            name="uq_catalog_recipe_fingerprint",
+        ),
+        Index("ix_catalog_recipes_cookbook", "catalog_cookbook_id"),
+        Index("ix_catalog_recipes_user_rating", "user_rating_avg", "id"),
+    )
+
+    catalog_cookbook_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalog_cookbooks.id", ondelete="CASCADE"), nullable=False
+    )
+    recipe_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    user_rating_avg: Mapped[Decimal | None] = mapped_column(Numeric(4, 2))
+    user_rating_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    catalog_cookbook: Mapped[CatalogCookbook] = relationship(back_populates="recipes")
+    reviews: Mapped[list["Review"]] = relationship(
+        back_populates="catalog_recipe", cascade="all, delete-orphan"
+    )
+    private_recipes: Mapped[list["Recipe"]] = relationship(back_populates="catalog_recipe")
 
 
 class Cookbook(UUIDTimestampMixin, Base):
@@ -92,6 +138,7 @@ class Cookbook(UUIDTimestampMixin, Base):
     __table_args__ = (
         Index("ix_cookbooks_user_created", "user_id", "created_at"),
         Index("ix_cookbooks_user_status", "user_id", "status"),
+        Index("ix_cookbooks_content_sha256", "content_sha256"),
     )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
@@ -101,6 +148,7 @@ class Cookbook(UUIDTimestampMixin, Base):
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     content_type: Mapped[str] = mapped_column(String(100), nullable=False)
     storage_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
     cover_path: Mapped[str | None] = mapped_column(String(1024))
     status: Mapped[UploadStatus] = mapped_column(
         Enum(UploadStatus, native_enum=False, length=20),
@@ -126,10 +174,14 @@ class Recipe(UUIDTimestampMixin, Base):
         Index("ix_recipes_title", "title", "id"),
         Index("ix_recipes_cuisine", "cuisine"),
         Index("ix_recipes_rating", "rating", "id"),
+        Index("ix_recipes_catalog_recipe", "catalog_recipe_id"),
     )
 
     cookbook_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("cookbooks.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    catalog_recipe_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("catalog_recipes.id", ondelete="SET NULL")
     )
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     servings: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
@@ -162,6 +214,9 @@ class Recipe(UUIDTimestampMixin, Base):
     image_key: Mapped[str | None] = mapped_column(String(64))
 
     cookbook: Mapped[Cookbook] = relationship(back_populates="recipes")
+    catalog_recipe: Mapped["CatalogRecipe | None"] = relationship(
+        back_populates="private_recipes"
+    )
     recipe_ingredients: Mapped[list["RecipeIngredient"]] = relationship(
         back_populates="recipe",
         cascade="all, delete-orphan",
@@ -260,6 +315,48 @@ class PantryItem(UUIDTimestampMixin, Base):
 
     user: Mapped[User] = relationship(back_populates="pantry_items")
     ingredient: Mapped[Ingredient] = relationship(back_populates="pantry_items")
+
+
+class Review(UUIDTimestampMixin, Base):
+    __tablename__ = "reviews"
+    __table_args__ = (
+        UniqueConstraint("user_id", "catalog_recipe_id", name="uq_review_user_catalog_recipe"),
+        Index("ix_reviews_catalog_recipe_created", "catalog_recipe_id", "created_at"),
+        Index("ix_reviews_user", "user_id"),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    catalog_recipe_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalog_recipes.id", ondelete="CASCADE"), nullable=False
+    )
+    rating: Mapped[int] = mapped_column(Integer, nullable=False)
+    body: Mapped[str | None] = mapped_column(Text)
+
+    user: Mapped[User] = relationship(back_populates="reviews")
+    catalog_recipe: Mapped[CatalogRecipe] = relationship(back_populates="reviews")
+    photos: Mapped[list["ReviewPhoto"]] = relationship(
+        back_populates="review",
+        cascade="all, delete-orphan",
+        order_by="ReviewPhoto.position",
+    )
+
+
+class ReviewPhoto(UUIDTimestampMixin, Base):
+    __tablename__ = "review_photos"
+    __table_args__ = (
+        UniqueConstraint("review_id", "position", name="uq_review_photo_position"),
+        Index("ix_review_photos_review", "review_id", "position"),
+    )
+
+    review_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("reviews.id", ondelete="CASCADE"), nullable=False
+    )
+    storage_path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    review: Mapped[Review] = relationship(back_populates="photos")
 
 
 class RefreshToken(UUIDTimestampMixin, Base):

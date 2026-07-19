@@ -72,7 +72,7 @@ const CUISINES = [
 ] as const
 
 const SORT_OPTIONS = [
-  { value: 'rating:desc', label: 'Highest rated', sort: 'rating' as const, order: 'desc' as const },
+  { value: 'rating:desc', label: 'Highest source rating', sort: 'rating' as const, order: 'desc' as const },
   { value: 'relevance:asc', label: 'Best match', sort: 'relevance' as const, order: 'asc' as const },
   { value: 'time:asc', label: 'Fastest', sort: 'time' as const, order: 'asc' as const },
   { value: 'protein:desc', label: 'Most protein', sort: 'protein' as const, order: 'desc' as const },

@@ -11,6 +11,7 @@ from sqlalchemy import (
     Integer,
     Text,
     and_,
+    case,
     cast,
     exists,
     func,
@@ -23,7 +24,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import aliased, selectinload
 
 from app.api.deps import DB, CurrentUser
-from app.models import Cookbook, Ingredient, PantryItem, Recipe, RecipeIngredient
+from app.models import CatalogRecipe, Cookbook, Ingredient, PantryItem, Recipe, RecipeIngredient
 from app.schemas.api import (
     NutritionOut,
     RecipeCookCreate,
@@ -33,6 +34,12 @@ from app.schemas.api import (
     RecipePage,
     RecipeUpdate,
 )
+from app.services.canonicalize import (
+    COOKING_ONION_NAMES,
+    SAUSAGE_NAMES,
+    ingredient_match_key,
+)
+from app.services.derivatives import parent_name_candidates
 from app.services.pantry_text import apply_quantity_delta
 from app.services.recipe_filters import (
     food_group_tag_candidates,
@@ -46,7 +53,6 @@ from app.services.recipe_images import (
     resolve_recipe_image_file,
 )
 from app.services.recipe_tagging import apply_manual_tags
-from app.services.derivatives import parent_name_candidates
 from app.services.units import (
     compare_quantities,
     ingredient_conversion_for_units,
@@ -141,6 +147,16 @@ def pantry_quantity_match_expression(ingredient_name):
     )
 
 
+def _ingredient_match_key_expression(name_column):
+    """SQL mirror of ingredient_match_key for list/makeable queries."""
+    normalized = func.lower(func.trim(name_column))
+    return case(
+        (normalized.in_(sorted(COOKING_ONION_NAMES)), "onion"),
+        (normalized.in_(sorted(SAUSAGE_NAMES)), "sausage"),
+        else_=normalized,
+    )
+
+
 def missing_count_expression(user_id: uuid.UUID):
     """Count unsatisfied ingredient groups (OR alternates use ANY matching)."""
     pantry_ingredient = aliased(Ingredient)
@@ -163,10 +179,12 @@ def missing_count_expression(user_id: uuid.UUID):
             "",
         )
     )
-    same_canonical = (
-        func.coalesce(pantry_ingredient.canonical_id, pantry_ingredient.id)
-        == func.coalesce(Ingredient.canonical_id, Ingredient.id)
-    )
+    same_canonical = func.coalesce(
+        pantry_ingredient.canonical_id, pantry_ingredient.id
+    ) == func.coalesce(Ingredient.canonical_id, Ingredient.id)
+    same_match_key = _ingredient_match_key_expression(
+        pantry_ingredient.name
+    ) == _ingredient_match_key_expression(Ingredient.name)
     derivative_parent_match = and_(
         recipe_name != parent_name,
         or_(
@@ -184,7 +202,7 @@ def missing_count_expression(user_id: uuid.UUID):
         .join(pantry_ingredient, pantry_ingredient.id == PantryItem.ingredient_id)
         .where(
             PantryItem.user_id == user_id,
-            or_(same_canonical, derivative_parent_match),
+            or_(same_canonical, same_match_key, derivative_parent_match),
             pantry_quantity_match_expression(Ingredient.name),
         )
     )
@@ -292,8 +310,11 @@ async def list_recipes(
             missing.label("missing_count"),
             sort_expr.label("sort_value"),
             Cookbook.title.label("cookbook_title"),
+            CatalogRecipe.user_rating_avg,
+            CatalogRecipe.user_rating_count,
         )
         .join(Cookbook, Cookbook.id == Recipe.cookbook_id)
+        .outerjoin(CatalogRecipe, CatalogRecipe.id == Recipe.catalog_recipe_id)
         .where(Cookbook.user_id == user.id)
     )
     search = q or query
@@ -367,6 +388,7 @@ async def list_recipes(
             id=recipe.id,
             cookbook_id=recipe.cookbook_id,
             cookbook_title=cookbook_title,
+            catalog_recipe_id=recipe.catalog_recipe_id,
             title=recipe.title,
             total_minutes=recipe.total_minutes,
             calories=recipe.calories,
@@ -374,6 +396,10 @@ async def list_recipes(
             cuisine=recipe.cuisine,
             rating=recipe.rating,
             rating_count=recipe.rating_count,
+            user_rating_avg=user_rating_avg,
+            user_rating_count=int(user_rating_count or 0)
+            if user_rating_count is not None
+            else None,
             tags=recipe.tags,
             tag_source=recipe.tag_source,
             created_at=recipe.created_at,
@@ -387,11 +413,18 @@ async def list_recipes(
             makeable=int(missing_value or 0) == 0,
             nutrition=nutrition_out(recipe),
         )
-        for recipe, missing_value, _, cookbook_title in rows
+        for (
+            recipe,
+            missing_value,
+            _,
+            cookbook_title,
+            user_rating_avg,
+            user_rating_count,
+        ) in rows
     ]
     next_cursor = None
     if has_more and rows:
-        last_recipe, _, last_sort_value, _ = rows[-1]
+        last_recipe, _, last_sort_value, _, _, _ = rows[-1]
         next_cursor = encode_cursor(last_sort_value, last_recipe.id)
     return RecipePage(items=items, next_cursor=next_cursor)
 
@@ -438,8 +471,15 @@ async def get_recipe(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> Recipe:
     missing = missing_count_expression(user.id)
     row = (
         await db.execute(
-            select(Recipe, missing.label("missing_count"), Cookbook.title.label("cookbook_title"))
+            select(
+                Recipe,
+                missing.label("missing_count"),
+                Cookbook.title.label("cookbook_title"),
+                CatalogRecipe.user_rating_avg,
+                CatalogRecipe.user_rating_count,
+            )
             .join(Cookbook, Cookbook.id == Recipe.cookbook_id)
+            .outerjoin(CatalogRecipe, CatalogRecipe.id == Recipe.catalog_recipe_id)
             .options(
                 selectinload(Recipe.recipe_ingredients).selectinload(RecipeIngredient.ingredient)
             )
@@ -448,9 +488,13 @@ async def get_recipe(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> Recipe:
     ).one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="Recipe not found")
-    recipe, missing_value, cookbook_title = row
+    recipe, missing_value, cookbook_title, user_rating_avg, user_rating_count = row
     recipe.missing_count = int(missing_value or 0)
     recipe.cookbook_title = cookbook_title
+    recipe.user_rating_avg = user_rating_avg
+    recipe.user_rating_count = (
+        int(user_rating_count or 0) if recipe.catalog_recipe_id is not None else None
+    )
     recipe.prep_time_minutes = recipe.prep_minutes
     recipe.cook_time_minutes = recipe.cook_minutes
     recipe.total_time_minutes = recipe.total_minutes
@@ -467,13 +511,18 @@ async def get_recipe(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> Recipe:
         )
     }
     pantry_by_name = {
-        " ".join(item.ingredient.name.lower().split()): item
-        for item in pantry_items.values()
+        " ".join(item.ingredient.name.lower().split()): item for item in pantry_items.values()
+    }
+    pantry_by_match_key = {
+        ingredient_match_key(item.ingredient.name): item for item in pantry_items.values()
     }
 
     def resolve_pantry_item(item: RecipeIngredient):
         match_key = item.ingredient.canonical_id or item.ingredient_id
         pantry_item = pantry_items.get(match_key)
+        if pantry_item is not None:
+            return pantry_item, None
+        pantry_item = pantry_by_match_key.get(ingredient_match_key(item.ingredient.name))
         if pantry_item is not None:
             return pantry_item, None
         for candidate in parent_name_candidates(item.ingredient.name):
@@ -606,9 +655,28 @@ async def get_recipe(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> Recipe:
     return recipe
 
 
+def _resolve_cook_pantry_item(
+    recipe_item: RecipeIngredient,
+    pantry_by_canonical: dict[object, PantryItem],
+    pantry_by_match_key: dict[str, PantryItem],
+    pantry_by_ingredient_id: dict[uuid.UUID, PantryItem] | None = None,
+) -> PantryItem | None:
+    match_key = recipe_item.ingredient.canonical_id or recipe_item.ingredient_id
+    pantry_item = pantry_by_canonical.get(match_key)
+    if pantry_item is not None:
+        return pantry_item
+    pantry_item = pantry_by_match_key.get(ingredient_match_key(recipe_item.ingredient.name))
+    if pantry_item is not None:
+        return pantry_item
+    if pantry_by_ingredient_id is not None:
+        return pantry_by_ingredient_id.get(recipe_item.ingredient_id)
+    return None
+
+
 def _default_cook_ingredients(
     recipe_ingredients: list[RecipeIngredient],
     pantry_by_canonical: dict[object, PantryItem],
+    pantry_by_match_key: dict[str, PantryItem],
 ) -> list[tuple[RecipeIngredient, Decimal | None, str | None]]:
     """Pick one ingredient per OR-group (prefer pantry match) and skip staples."""
     groups: dict[object, list[RecipeIngredient]] = {}
@@ -629,8 +697,9 @@ def _default_cook_ingredients(
             continue
 
         def rank(member: RecipeIngredient) -> tuple[int, int]:
-            match_key = member.ingredient.canonical_id or member.ingredient_id
-            pantry_item = pantry_by_canonical.get(match_key)
+            pantry_item = _resolve_cook_pantry_item(
+                member, pantry_by_canonical, pantry_by_match_key
+            )
             if pantry_item is None:
                 return (2, 0)
             comparison = compare_quantities(
@@ -681,16 +750,20 @@ async def cook_recipe(
         )
     )
     pantry_by_canonical: dict[object, PantryItem] = {}
+    pantry_by_match_key: dict[str, PantryItem] = {}
     pantry_by_ingredient_id: dict[uuid.UUID, PantryItem] = {}
     for item in pantry_items:
         pantry_by_ingredient_id[item.ingredient_id] = item
         key = item.ingredient.canonical_id or item.ingredient_id
         pantry_by_canonical[key] = item
+        pantry_by_match_key[ingredient_match_key(item.ingredient.name)] = item
 
     recipe_by_id = {item.ingredient_id: item for item in recipe.recipe_ingredients}
 
     if body.items is None:
-        deductions = _default_cook_ingredients(recipe.recipe_ingredients, pantry_by_canonical)
+        deductions = _default_cook_ingredients(
+            recipe.recipe_ingredients, pantry_by_canonical, pantry_by_match_key
+        )
     else:
         if not body.items:
             raise HTTPException(
@@ -715,10 +788,12 @@ async def cook_recipe(
     touched: set[uuid.UUID] = set()
 
     for recipe_item, quantity, unit in deductions:
-        match_key = recipe_item.ingredient.canonical_id or recipe_item.ingredient_id
-        pantry_item = pantry_by_canonical.get(match_key)
-        if pantry_item is None:
-            pantry_item = pantry_by_ingredient_id.get(recipe_item.ingredient_id)
+        pantry_item = _resolve_cook_pantry_item(
+            recipe_item,
+            pantry_by_canonical,
+            pantry_by_match_key,
+            pantry_by_ingredient_id,
+        )
         if pantry_item is None:
             skipped.append(recipe_item.ingredient.name)
             continue
@@ -739,7 +814,13 @@ async def cook_recipe(
         )
         if remove_item:
             removed.append(name)
-            pantry_by_canonical.pop(match_key, None)
+            canonical_key = (
+                pantry_item.ingredient.canonical_id or pantry_item.ingredient_id
+            )
+            pantry_by_canonical.pop(canonical_key, None)
+            pantry_by_match_key.pop(
+                ingredient_match_key(pantry_item.ingredient.name), None
+            )
             pantry_by_ingredient_id.pop(pantry_item.ingredient_id, None)
             await db.delete(pantry_item)
             touched.add(pantry_item.id)

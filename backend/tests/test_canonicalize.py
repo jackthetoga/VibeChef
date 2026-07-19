@@ -6,7 +6,11 @@ from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models import Ingredient
 from app.services import canonicalize as canonicalize_module
-from app.services.canonicalize import canonicalize_ingredients
+from app.services.canonicalize import (
+    canonicalize_ingredients,
+    heuristic_canonical_name,
+    ingredient_match_key,
+)
 
 
 @pytest.mark.asyncio
@@ -80,6 +84,25 @@ async def test_canonicalize_ignores_missing_and_invalid_results(
         assert thyme.canonical_id is None
 
 
+def test_match_keys_for_cooking_onions_and_pork_sausage() -> None:
+    assert ingredient_match_key("yellow onion") == "onion"
+    assert ingredient_match_key("white onion") == "onion"
+    assert ingredient_match_key("onion") == "onion"
+    assert ingredient_match_key("red onion") == "red onion"
+    assert ingredient_match_key("pork sausage") == "sausage"
+    assert ingredient_match_key("sausage") == "sausage"
+    assert ingredient_match_key("italian sausage") == "italian sausage"
+
+
+def test_heuristic_canonical_name_maps_onion_and_sausage_variants() -> None:
+    assert heuristic_canonical_name("yellow onion") == "onion"
+    assert heuristic_canonical_name("white onions") == "onion"
+    assert heuristic_canonical_name("pork sausage") == "sausage"
+    assert heuristic_canonical_name("red onion") is None
+    assert heuristic_canonical_name("onion") is None
+    assert heuristic_canonical_name("italian sausage") is None
+
+
 @pytest.mark.asyncio
 async def test_canonicalize_without_api_key_applies_heuristics_only(
     monkeypatch: pytest.MonkeyPatch,
@@ -99,10 +122,15 @@ async def test_canonicalize_without_api_key_applies_heuristics_only(
         oil = Ingredient(name="light olive oil")
         zest = Ingredient(name="lemon zest")
         canned = Ingredient(name="canned imported italian plum tomatoes")
-        db.add_all([oil, zest, canned])
+        yellow_onion = Ingredient(name="yellow onion")
+        pork_sausage = Ingredient(name="pork sausage")
+        red_onion = Ingredient(name="red onion")
+        db.add_all([oil, zest, canned, yellow_onion, pork_sausage, red_onion])
         await db.flush()
 
-        await canonicalize_ingredients(db, [oil, zest, canned])
+        await canonicalize_ingredients(
+            db, [oil, zest, canned, yellow_onion, pork_sausage, red_onion]
+        )
 
         assert oil.canonical_id is None
         assert zest.canonical_id is not None
@@ -113,3 +141,12 @@ async def test_canonicalize_without_api_key_applies_heuristics_only(
         root = await db.get(Ingredient, canned.canonical_id)
         assert root is not None
         assert root.name == "canned tomatoes"
+        assert yellow_onion.canonical_id is not None
+        onion = await db.get(Ingredient, yellow_onion.canonical_id)
+        assert onion is not None
+        assert onion.name == "onion"
+        assert pork_sausage.canonical_id is not None
+        sausage = await db.get(Ingredient, pork_sausage.canonical_id)
+        assert sausage is not None
+        assert sausage.name == "sausage"
+        assert red_onion.canonical_id is None

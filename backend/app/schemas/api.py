@@ -320,6 +320,7 @@ class RecipeOut(ORMModel):
     id: UUID
     cookbook_id: UUID
     cookbook_title: str | None = None
+    catalog_recipe_id: UUID | None = None
     title: str
     servings: Decimal | None
     prep_minutes: int | None
@@ -332,6 +333,8 @@ class RecipeOut(ORMModel):
     cuisine: str | None
     rating: Decimal | None = None
     rating_count: int | None = None
+    user_rating_avg: Decimal | None = None
+    user_rating_count: int | None = None
     tags: list[str]
     tag_source: str | None = None
     steps: list[str]
@@ -355,6 +358,7 @@ class RecipeListItem(ORMModel):
     id: UUID
     cookbook_id: UUID
     cookbook_title: str | None = None
+    catalog_recipe_id: UUID | None = None
     title: str
     total_minutes: int | None
     calories: Decimal | None
@@ -362,6 +366,8 @@ class RecipeListItem(ORMModel):
     cuisine: str | None
     rating: Decimal | None = None
     rating_count: int | None = None
+    user_rating_avg: Decimal | None = None
+    user_rating_count: int | None = None
     tags: list[str]
     tag_source: str | None = None
     created_at: datetime
@@ -430,3 +436,68 @@ class RecipeCookOut(BaseModel):
     updated: list[PantryOut]
     removed: list[str]
     skipped: list[str]
+
+
+class CatalogRecipeOut(ORMModel):
+    id: UUID
+    title: str
+    user_rating_avg: Decimal | None = None
+    user_rating_count: int = 0
+    created_at: datetime
+
+
+class ReviewPhotoOut(ORMModel):
+    id: UUID
+    position: int
+    url: str
+
+
+class ReviewOut(ORMModel):
+    id: UUID
+    catalog_recipe_id: UUID
+    user_id: UUID
+    display_name: str | None = None
+    rating: int
+    body: str | None = None
+    photos: list[ReviewPhotoOut] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReviewCreate(BaseModel):
+    rating: int = Field(ge=1, le=5)
+    body: str | None = Field(default=None, max_length=5000)
+
+    @field_validator("body")
+    @classmethod
+    def normalize_body(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
+
+class ReviewUpdate(BaseModel):
+    rating: int | None = Field(default=None, ge=1, le=5)
+    body: str | None = Field(default=None, max_length=5000)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("body")
+    @classmethod
+    def normalize_body(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
+    @model_validator(mode="after")
+    def require_at_least_one_field(self) -> "ReviewUpdate":
+        if not self.model_fields_set:
+            raise ValueError("Provide at least one field to update")
+        return self
+
+
+class ReviewPage(BaseModel):
+    items: list[ReviewOut]
+    next_cursor: str | None = None

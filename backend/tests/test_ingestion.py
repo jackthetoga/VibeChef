@@ -108,9 +108,7 @@ def test_duplicate_extractions_are_removed_without_dropping_distinct_recipes() -
     duplicate = first.model_copy(deep=True)
     distinct = first.model_copy(
         update={
-            "ingredients": [
-                ExtractedIngredient(canonical_name="tomato", raw_text="4 tomatoes")
-            ]
+            "ingredients": [ExtractedIngredient(canonical_name="tomato", raw_text="4 tomatoes")]
         },
         deep=True,
     )
@@ -339,9 +337,7 @@ def test_canned_tomato_or_alternate_matches_canned_tomatoes_name() -> None:
     assert alternates[1].canonical_name == "canned tomatoes"
     assert alternates[1].quantity == Decimal("2")
     assert alternates[1].unit == "cups"
-    assert (
-        heuristic_canonical_name("canned imported italian plum tomatoes") == "canned tomatoes"
-    )
+    assert heuristic_canonical_name("canned imported italian plum tomatoes") == "canned tomatoes"
 
 
 def test_meaty_ripe_red_bell_peppers_keeps_full_noun() -> None:
@@ -596,9 +592,7 @@ def test_simon_schuster_profile_skips_headnotes_and_variations(tmp_path: Path) -
         "salt",
     ]
     assert rice.steps
-    assert "Every Persian has a special relationship with rice." not in " ".join(
-        rice.steps
-    )
+    assert "Every Persian has a special relationship with rice." not in " ".join(rice.steps)
     assert not any("Saffron" in recipe.title for recipe in recipes)
     salsa = by_title["Basic Salsa Verde"]
     assert salsa.servings is None  # volume yield ignored
@@ -645,9 +639,7 @@ def test_sfah_epub_simon_schuster_profile_recovers_recipes() -> None:
     assert rice.servings == Decimal("5")
     assert any("rice" in item.canonical_name for item in rice.ingredients)
     assert rice.steps
-    assert "Every Persian has a special relationship with rice" not in " ".join(
-        rice.steps
-    )
+    assert "Every Persian has a special relationship with rice" not in " ".join(rice.steps)
     salsa = by_title["Basic Salsa Verde"]
     assert len(salsa.ingredients) >= 3
     assert all(recipe.ingredients for recipe in recipes)
@@ -668,9 +660,7 @@ def test_hazan_epub_structured_parse_recovers_full_cookbook() -> None:
     assert "Bruschetta—Roman Garlic Bread — Basic Bruschetta" in by_title
     assert "Bruschetta—Roman Garlic Bread" not in by_title
     assert "Variation with Butter and Parmesan" not in by_title
-    finocchio = by_title[
-        "Braised Finocchio with Olive Oil — Variation with Butter and Parmesan"
-    ]
+    finocchio = by_title["Braised Finocchio with Olive Oil — Variation with Butter and Parmesan"]
     names = {item.canonical_name for item in finocchio.ingredients}
     assert "butter" in names
     assert "parmigiano-reggiano cheese" in names
@@ -686,8 +676,7 @@ def test_hazan_epub_structured_parse_recovers_full_cookbook() -> None:
     assert any("squid" in name for name in squid_names)
     assert any("pea" in name for name in squid_names)
     assert any(
-        item.alternate_group and "squid" in item.canonical_name
-        for item in squid.ingredients
+        item.alternate_group and "squid" in item.canonical_name for item in squid.ingredients
     )
     variation = by_title[
         "Squid with Tomatoes and Peas, Tuscan Style — Alternative Uses for Squid and Tomatoes"
@@ -699,8 +688,7 @@ def test_hazan_epub_structured_parse_recovers_full_cookbook() -> None:
     marinara_names = {item.canonical_name for item in marinara.ingredients}
     assert any("tomato" in name for name in marinara_names)
     assert any(
-        item.alternate_group and "tomato" in item.canonical_name
-        for item in marinara.ingredients
+        item.alternate_group and "tomato" in item.canonical_name for item in marinara.ingredients
     )
     peas_peppers = by_title["Peas, Peppers, and Prosciutto Sauce with Cream"]
     peas_peppers_names = [item.canonical_name for item in peas_peppers.ingredients]

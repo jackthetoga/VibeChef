@@ -77,7 +77,9 @@ def test_epub_recipe_image_extraction(tmp_path: Path) -> None:
     assert (tmp_path / assignment.path).is_file()
 
 
-def test_assign_without_corpus_returns_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_assign_without_corpus_returns_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from app.services import recipe_images
 
     monkeypatch.setattr(recipe_images, "MANIFEST_PATH", tmp_path / "manifest.json")

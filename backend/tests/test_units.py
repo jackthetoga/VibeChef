@@ -76,6 +76,32 @@ def test_ingredient_piece_weights_convert_count_to_mass() -> None:
     )
 
 
+def test_large_onion_piece_equals_about_two_cups() -> None:
+    """One large onion ≈ 2 cups diced; 2.5 pieces covers a 2-cup recipe line."""
+    assert compare_quantities(
+        Decimal("2.5"),
+        "pieces",
+        Decimal("2"),
+        "cups",
+        "onion",
+    )
+    assert compare_quantities(
+        Decimal("1"),
+        "piece",
+        Decimal("2"),
+        "cups",
+        "yellow onion",
+    )
+    # Half an onion is not enough for 2 cups.
+    assert not compare_quantities(
+        Decimal("0.5"),
+        "pieces",
+        Decimal("2"),
+        "cups",
+        "onion",
+    )
+
+
 def test_unitless_count_converts_to_mass_using_item_weight() -> None:
     """Recipe '1 carrot' (no unit) should be satisfied by ~0.7 lb carrots in pantry."""
     assert compare_quantities(

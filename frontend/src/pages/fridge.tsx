@@ -57,6 +57,12 @@ function draftsFromScan(items: PantryScanItem[]): ScanDraftRow[] {
   }))
 }
 
+/** iPhone photos often arrive as HEIC/HEIF with an empty MIME type in some browsers. */
+function isSupportedPhoto(file: File) {
+  if (file.type.startsWith('image/')) return true
+  return /\.(jpe?g|png|webp|heic|heif)$/i.test(file.name)
+}
+
 function expiryState(value?: string | null) {
   if (!value) return null
   const today = new Date()
@@ -424,8 +430,8 @@ export function FridgePage() {
     const file = event.target.files?.[0]
     event.target.value = ''
     if (!file) return
-    if (!file.type.startsWith('image/')) {
-      toast.error('Please choose a photo (JPEG, PNG, or WebP).')
+    if (!isSupportedPhoto(file)) {
+      toast.error('Please choose a photo (JPEG, PNG, WebP, HEIC, or HEIF).')
       return
     }
     scanPhoto.mutate(file)
@@ -435,8 +441,8 @@ export function FridgePage() {
     const file = event.target.files?.[0]
     event.target.value = ''
     if (!file) return
-    if (!file.type.startsWith('image/')) {
-      toast.error('Please choose a photo (JPEG, PNG, or WebP).')
+    if (!isSupportedPhoto(file)) {
+      toast.error('Please choose a photo (JPEG, PNG, WebP, HEIC, or HEIF).')
       return
     }
     scanReceipt.mutate(file)
@@ -493,7 +499,7 @@ export function FridgePage() {
       <input
         ref={scanInputRef}
         type="file"
-        accept="image/*"
+        accept="image/*,.heic,.heif,image/heic,image/heif"
         capture="environment"
         className="sr-only"
         aria-hidden
@@ -503,7 +509,7 @@ export function FridgePage() {
       <input
         ref={receiptInputRef}
         type="file"
-        accept="image/*"
+        accept="image/*,.heic,.heif,image/heic,image/heif"
         capture="environment"
         className="sr-only"
         aria-hidden

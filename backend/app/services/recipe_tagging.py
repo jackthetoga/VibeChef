@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable, Literal
+from typing import Literal
 
 from app.core.config import settings
 from app.services.common_ingredients import COMMON_INGREDIENT_CATEGORIES
@@ -14,15 +15,15 @@ from app.services.llm import chat_completion
 from app.services.recipe_filters import (
     CATEGORY_SET,
     DISH_TAG_SET,
+    DISH_TAGS,
     FOOD_GROUP_SET,
+    FOOD_GROUPS,
     FRUIT_NAME_HINTS,
     IMAGE_SLUG_TO_CATEGORY,
     IMAGE_SLUG_TO_DISH_TAG,
     PANTRY_CATEGORY_TO_FOOD_GROUP,
     RECIPE_CATEGORIES,
     RECIPE_CUISINES,
-    DISH_TAGS,
-    FOOD_GROUPS,
     merge_recipe_tags,
     normalize_category,
     normalize_cuisine,
@@ -315,12 +316,12 @@ class TagAssignment:
 
 
 def _haystack(title: str, cuisine: str | None, tags: list[str] | None) -> str:
-    return " ".join(
-        part for part in [title, cuisine or "", " ".join(tags or [])] if part
-    ).lower()
+    return " ".join(part for part in [title, cuisine or "", " ".join(tags or [])] if part).lower()
 
 
-def guess_cuisine(title: str, cuisine: str | None = None, tags: list[str] | None = None) -> str | None:
+def guess_cuisine(
+    title: str, cuisine: str | None = None, tags: list[str] | None = None
+) -> str | None:
     existing = normalize_cuisine(cuisine)
     if existing:
         return existing

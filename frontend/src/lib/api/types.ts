@@ -77,8 +77,13 @@ export interface Recipe {
   title: string
   description?: string | null
   cuisine?: string | null
+  /** Source/imported rating (e.g. MyPlate), not community reviews. */
   rating?: number | null
   rating_count?: number | null
+  catalog_recipe_id?: string | null
+  /** Community review average from in-app reviews. */
+  user_rating_avg?: number | null
+  user_rating_count?: number | null
   source?: string | null
   source_url?: string | null
   source_page?: number | null
@@ -98,6 +103,29 @@ export interface Recipe {
   tags?: string[]
   tag_source?: string | null
   parse_warnings?: string[]
+}
+
+export interface RecipeReviewPhoto {
+  id: string
+  position: number
+  url: string
+}
+
+export interface RecipeReview {
+  id: string
+  catalog_recipe_id: string
+  user_id: string
+  display_name?: string | null
+  rating: number
+  body?: string | null
+  photos: RecipeReviewPhoto[]
+  created_at: string
+  updated_at: string
+}
+
+export interface RecipeReviewInput {
+  rating: number
+  body?: string | null
 }
 
 export interface RecipeTagUpdate {

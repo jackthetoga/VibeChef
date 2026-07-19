@@ -40,9 +40,9 @@ from app.services.ingredient_conversions import INGREDIENT_CONVERSIONS
 from app.services.pantry_text import apply_quantity_delta, parse_pantry_text
 from app.services.pantry_vision import (
     MAX_IMAGE_BYTES,
+    normalize_pantry_image,
     scan_groceries_from_image,
     scan_receipt_from_image,
-    sniff_image_media_type,
 )
 
 ingredient_router = APIRouter(prefix="/ingredients", tags=["ingredients"])
@@ -472,7 +472,9 @@ async def _read_pantry_image(file: UploadFile, *, default_filename: str) -> tupl
             detail="Image exceeds the 10 MB size limit",
         )
     try:
-        media_type = sniff_image_media_type(content, file.content_type, original.name)
+        content, media_type = normalize_pantry_image(
+            content, file.content_type, original.name
+        )
     except ValueError as exc:
         raise HTTPException(status_code=415, detail=str(exc)) from exc
     return content, media_type

@@ -27,6 +27,8 @@ dependencies = [
   "redis>=5.2",
   "sqlalchemy[asyncio]>=2.0",
   "uvicorn[standard]>=0.32",
+  "pillow>=12.3.0",
+  "pillow-heif>=1.4.0",
 ]
 
 [project.optional-dependencies]

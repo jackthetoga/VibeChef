@@ -17,6 +17,8 @@ import type {
   RecipeCookItem,
   RecipeCookResult,
   RecipeFilters,
+  RecipeReview,
+  RecipeReviewInput,
   RecipeTagUpdate,
   User,
 } from './types'
@@ -222,6 +224,48 @@ export const recipesApi = {
     if (!response.ok) throw await parseError(response)
     return response.blob()
   },
+}
+
+export const reviewsApi = {
+  list: (catalogRecipeId: string) =>
+    request<{ items: RecipeReview[] }>(
+      `/catalog/recipes/${encodeURIComponent(catalogRecipeId)}/reviews`,
+    ),
+  mine: (catalogRecipeId: string) =>
+    request<RecipeReview | null>(
+      `/catalog/recipes/${encodeURIComponent(catalogRecipeId)}/reviews/me`,
+    ),
+  create: (catalogRecipeId: string, input: RecipeReviewInput) =>
+    request<RecipeReview>(`/catalog/recipes/${encodeURIComponent(catalogRecipeId)}/reviews`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  updateMine: (catalogRecipeId: string, input: Partial<RecipeReviewInput>) =>
+    request<RecipeReview>(
+      `/catalog/recipes/${encodeURIComponent(catalogRecipeId)}/reviews/me`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(input),
+      },
+    ),
+  deleteMine: (catalogRecipeId: string) =>
+    request<{ detail: string }>(
+      `/catalog/recipes/${encodeURIComponent(catalogRecipeId)}/reviews/me`,
+      { method: 'DELETE' },
+    ),
+  addPhoto: (catalogRecipeId: string, file: File) => {
+    const body = new FormData()
+    body.append('file', file)
+    return request<RecipeReview>(
+      `/catalog/recipes/${encodeURIComponent(catalogRecipeId)}/reviews/me/photos`,
+      { method: 'POST', body },
+    )
+  },
+  deletePhoto: (catalogRecipeId: string, photoId: string) =>
+    request<RecipeReview>(
+      `/catalog/recipes/${encodeURIComponent(catalogRecipeId)}/reviews/me/photos/${encodeURIComponent(photoId)}`,
+      { method: 'DELETE' },
+    ),
 }
 
 export const pantryApi = {

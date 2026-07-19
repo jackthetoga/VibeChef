@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from decimal import Decimal, InvalidOperation
+from io import BytesIO
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
@@ -18,6 +19,21 @@ ALLOWED_IMAGE_TYPES = {
     "image/jpeg": {".jpg", ".jpeg"},
     "image/png": {".png"},
     "image/webp": {".webp"},
+    "image/heic": {".heic"},
+    "image/heif": {".heif"},
+}
+_HEIF_BRANDS = {
+    b"heic",
+    b"heix",
+    b"hevc",
+    b"hevx",
+    b"heim",
+    b"heis",
+    b"hevm",
+    b"hevs",
+    b"mif1",
+    b"msf1",
+    b"heif",
 }
 
 
@@ -68,6 +84,10 @@ def demo_receipt_items() -> list[ScannedGrocery]:
     ]
 
 
+def _looks_like_heif(content: bytes) -> bool:
+    return len(content) >= 12 and content[4:8] == b"ftyp" and content[8:12] in _HEIF_BRANDS
+
+
 def sniff_image_media_type(content: bytes, content_type: str | None, filename: str) -> str:
     declared = (content_type or "").split(";")[0].strip().lower()
     if declared in ALLOWED_IMAGE_TYPES:
@@ -82,7 +102,40 @@ def sniff_image_media_type(content: bytes, content_type: str | None, filename: s
         return "image/png"
     if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
         return "image/webp"
-    raise ValueError("Only JPEG, PNG, and WebP images are supported")
+    if _looks_like_heif(content):
+        return "image/heic"
+    raise ValueError("Only JPEG, PNG, WebP, HEIC, and HEIF images are supported")
+
+
+def _heif_to_jpeg(content: bytes) -> tuple[bytes, str]:
+    """Decode iPhone HEIC/HEIF into JPEG for vision APIs that do not accept HEIF."""
+    try:
+        import pillow_heif
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - dependency is required in prod
+        raise ValueError("HEIC/HEIF support is unavailable on this server") from exc
+
+    pillow_heif.register_heif_opener()
+    try:
+        with Image.open(BytesIO(content)) as image:
+            rgb = image.convert("RGB")
+            buffer = BytesIO()
+            rgb.save(buffer, format="JPEG", quality=90)
+            return buffer.getvalue(), "image/jpeg"
+    except Exception as exc:
+        logger.warning("Failed to decode HEIC/HEIF upload: %s", exc)
+        raise ValueError("Could not decode HEIC/HEIF image. Try exporting as JPEG.") from exc
+
+
+def normalize_pantry_image(
+    content: bytes,
+    content_type: str | None,
+    filename: str,
+) -> tuple[bytes, str]:
+    media_type = sniff_image_media_type(content, content_type, filename)
+    if media_type in {"image/heic", "image/heif"}:
+        return _heif_to_jpeg(content)
+    return content, media_type
 
 
 def _parse_json_payload(raw: str) -> object:
@@ -129,7 +182,10 @@ async def _scan_image_with_prompt(
         messages_user = user_content
         if validation_error:
             messages_user = [
-                {"type": "text", "text": f"{prompt}\n\nPrevious output was invalid: {validation_error}"},
+                {
+                    "type": "text",
+                    "text": f"{prompt}\n\nPrevious output was invalid: {validation_error}",
+                },
                 {"type": "image_url", "image_url": {"url": data_url}},
             ]
         try:
@@ -142,7 +198,13 @@ async def _scan_image_with_prompt(
                 timeout=90.0,
             )
             return _coerce_items(_parse_json_payload(raw))
-        except (ValidationError, json.JSONDecodeError, InvalidOperation, KeyError, TypeError) as exc:
+        except (
+            ValidationError,
+            json.JSONDecodeError,
+            InvalidOperation,
+            KeyError,
+            TypeError,
+        ) as exc:
             validation_error = str(exc)
             if attempt:
                 logger.exception("Failed to parse %s scan response", log_label)
@@ -167,7 +229,7 @@ async def scan_groceries_from_image(
         "Return JSON only matching this schema:\n"
         f"{schema}\n\n"
         "Rules:\n"
-        "- Use short lowercase ingredient names (e.g. \"olive oil\", \"eggs\", \"tomatoes\").\n"
+        '- Use short lowercase ingredient names (e.g. "olive oil", "eggs", "tomatoes").\n'
         "- Include quantity and unit when clearly visible on packaging or countable;\n"
         "  otherwise set quantity and unit to null.\n"
         "- Prefer common cooking units (g, kg, ml, l, cup, tbsp, pieces, bunch).\n"
@@ -204,8 +266,8 @@ async def scan_receipt_from_image(
         "Rules:\n"
         "- Read printed receipt line items only (not fridge contents or surrounding objects).\n"
         "- Map branded SKUs to short lowercase pantry names "
-        "(e.g. \"horizon organic whole milk\" → \"milk\").\n"
-        "- Prefer pack quantity when printed (e.g. \"2 × eggs\" → quantity 2, unit \"pieces\");\n"
+        '(e.g. "horizon organic whole milk" → "milk").\n'
+        '- Prefer pack quantity when printed (e.g. "2 × eggs" → quantity 2, unit "pieces");\n'
         "  otherwise set quantity and unit to null.\n"
         "- Prefer common cooking units (g, kg, ml, l, cup, tbsp, pieces, bunch, loaf).\n"
         "- Skip tax, fees, bags, coupons, deposits, and non-food lines.\n"

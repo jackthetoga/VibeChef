@@ -1,3 +1,4 @@
+import hashlib
 import uuid
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from app.api.deps import DB, CurrentUser
 from app.core.config import settings
 from app.models import Cookbook, Recipe, UploadStatus
 from app.schemas.api import CookbookOut, Message
+from app.services.catalog import find_or_create_catalog_cookbook
 from app.services.ingestion import cover_media_type, process_cookbook
 from app.services.recipe_images import delete_cookbook_recipe_images
 
@@ -71,9 +73,7 @@ def with_cover_url(cookbook: Cookbook) -> Cookbook:
 
 
 async def with_recipe_count(db: DB, cookbook: Cookbook) -> Cookbook:
-    count = await db.scalar(
-        select(func.count(Recipe.id)).where(Recipe.cookbook_id == cookbook.id)
-    )
+    count = await db.scalar(select(func.count(Recipe.id)).where(Recipe.cookbook_id == cookbook.id))
     cookbook.recipe_count = int(count or 0)
     return with_cover_url(cookbook)
 
@@ -171,6 +171,7 @@ async def upload_cookbook(
     destination = settings.upload_dir / f"{uuid.uuid4()}{suffix}"
     total = 0
     first = b""
+    digest = hashlib.sha256()
     try:
         with destination.open("wb") as output:
             while chunk := await file.read(1024 * 1024):
@@ -183,6 +184,7 @@ async def upload_cookbook(
                         status_code=413,
                         detail="Upload exceeds configured size limit",
                     )
+                digest.update(chunk)
                 output.write(chunk)
     except Exception:
         destination.unlink(missing_ok=True)
@@ -199,12 +201,17 @@ async def upload_cookbook(
         destination.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="File signature does not match its extension")
 
+    content_sha256 = digest.hexdigest()
+    cookbook_title = (title or original.stem).strip()[:255] or "Untitled cookbook"
+    await find_or_create_catalog_cookbook(db, content_sha256=content_sha256, title=cookbook_title)
+
     cookbook = Cookbook(
         user_id=user.id,
-        title=(title or original.stem).strip()[:255] or "Untitled cookbook",
+        title=cookbook_title,
         original_filename=original.name[:255],
         content_type=CONTENT_TYPE_BY_SUFFIX[suffix],
         storage_path=str(destination.resolve()),
+        content_sha256=content_sha256,
     )
     db.add(cookbook)
     await db.commit()
