@@ -65,15 +65,10 @@ class UserOut(ORMModel):
     created_at: datetime
 
 
-class TokenPair(BaseModel):
+class AccessTokenResponse(BaseModel):
     access_token: str
-    refresh_token: str
     token_type: str = "bearer"
     expires_in: int
-
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
 
 
 class Message(BaseModel):
@@ -86,6 +81,7 @@ class CookbookOut(ORMModel):
     original_filename: str
     content_type: str
     status: UploadStatus
+    enabled: bool
     progress: int
     recipe_count: int = 0
     error: str | None
@@ -94,10 +90,15 @@ class CookbookOut(ORMModel):
     updated_at: datetime
 
 
+class CookbookUpdate(BaseModel):
+    enabled: bool
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class IngredientOut(ORMModel):
     id: UUID
     name: str
-    aliases: list[str]
     category: str | None
     staple: bool
     canonical_id: UUID | None = None
@@ -273,6 +274,52 @@ class PantryConfirmOut(BaseModel):
     added: list[PantryOut]
     updated: list[PantryOut]
     skipped_existing: list[str] = Field(default_factory=list)
+
+
+class UnlockRecipeOut(BaseModel):
+    id: UUID
+    title: str
+    image_url: str | None = None
+
+
+class IngredientUnlockOut(BaseModel):
+    ingredient_id: UUID
+    name: str
+    category: str | None = None
+    status: Literal["missing", "insufficient"]
+    pantry_item_id: UUID | None = None
+    unlock_count: int
+    near_unlock_count: int
+    unlocked_recipes: list[UnlockRecipeOut] = Field(default_factory=list)
+
+
+class UnlockSetIngredientOut(BaseModel):
+    ingredient_id: UUID
+    name: str
+    family_name: str
+    category: str | None = None
+    status: Literal["missing", "insufficient"]
+    pantry_item_id: UUID | None = None
+
+
+class UnlockSetRecipeOut(UnlockRecipeOut):
+    covered_by: list[UUID] = Field(default_factory=list)
+
+
+class IngredientUnlockSetOut(BaseModel):
+    ingredients: list[UnlockSetIngredientOut]
+    unlock_count: int
+    synergy_count: int
+    incremental_count: int
+    near_unlock_count: int
+    unlocked_recipes: list[UnlockSetRecipeOut] = Field(default_factory=list)
+
+
+class IngredientUnlockSetPage(BaseModel):
+    item_count: int
+    candidate_count: int
+    quality_excluded_recipe_count: int
+    items: list[IngredientUnlockSetOut]
 
 
 class RecipeIngredientOut(ORMModel):

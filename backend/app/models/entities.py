@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Enum,
@@ -155,6 +156,7 @@ class Cookbook(UUIDTimestampMixin, Base):
         default=UploadStatus.pending,
         nullable=False,
     )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     progress: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error: Mapped[str | None] = mapped_column(Text)
 
@@ -224,12 +226,24 @@ class Recipe(UUIDTimestampMixin, Base):
     )
 
 
+class IngredientFamily(UUIDTimestampMixin, Base):
+    """Shopping-level family without collapsing non-interchangeable ingredient forms."""
+
+    __tablename__ = "ingredient_families"
+
+    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    category: Mapped[str | None] = mapped_column(String(120))
+
+    ingredients: Mapped[list["Ingredient"]] = relationship(back_populates="family")
+
+
 class Ingredient(UUIDTimestampMixin, Base):
     __tablename__ = "ingredients"
     __table_args__ = (
         Index("ix_ingredients_name", "name"),
         Index("ix_ingredients_category", "category"),
         Index("ix_ingredients_canonical", "canonical_id"),
+        Index("ix_ingredients_family", "family_id"),
     )
 
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
@@ -239,6 +253,12 @@ class Ingredient(UUIDTimestampMixin, Base):
     canonical_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("ingredients.id", ondelete="SET NULL")
     )
+    family_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("ingredient_families.id", ondelete="SET NULL")
+    )
+    quality_flags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    normalization_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    canonicalization_confidence: Mapped[Decimal | None] = mapped_column(Numeric(4, 3))
     fdc_id: Mapped[int | None] = mapped_column(Integer, index=True)
     fdc_description: Mapped[str | None] = mapped_column(String(512))
     calories_per_100g: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
@@ -248,6 +268,7 @@ class Ingredient(UUIDTimestampMixin, Base):
 
     recipe_ingredients: Mapped[list["RecipeIngredient"]] = relationship(back_populates="ingredient")
     pantry_items: Mapped[list["PantryItem"]] = relationship(back_populates="ingredient")
+    family: Mapped[IngredientFamily | None] = relationship(back_populates="ingredients")
 
 
 class FoodNutritionCache(UUIDTimestampMixin, Base):
@@ -291,6 +312,8 @@ class RecipeIngredient(UUIDTimestampMixin, Base):
     position: Mapped[int] = mapped_column(Integer, nullable=False)
     alternate_group_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
     section: Mapped[str | None] = mapped_column(String(255))
+    parse_status: Mapped[str] = mapped_column(String(20), default="valid", nullable=False)
+    quality_flags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
 
     recipe: Mapped[Recipe] = relationship(back_populates="recipe_ingredients")
     ingredient: Mapped[Ingredient] = relationship(back_populates="recipe_ingredients")
@@ -320,6 +343,7 @@ class PantryItem(UUIDTimestampMixin, Base):
 class Review(UUIDTimestampMixin, Base):
     __tablename__ = "reviews"
     __table_args__ = (
+        CheckConstraint("rating >= 1 AND rating <= 5", name="ck_reviews_rating_range"),
         UniqueConstraint("user_id", "catalog_recipe_id", name="uq_review_user_catalog_recipe"),
         Index("ix_reviews_catalog_recipe_created", "catalog_recipe_id", "created_at"),
         Index("ix_reviews_user", "user_id"),

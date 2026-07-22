@@ -1,21 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { authApi, clearSession, onSessionCleared, recipesApi } from './client'
+import { authApi, clearSession, onSessionCleared, pantryApi, recipesApi } from './client'
 
 describe('API client authentication', () => {
   beforeEach(() => {
     clearSession()
-    localStorage.clear()
     vi.restoreAllMocks()
   })
 
   it('refreshes once and retries a request after a 401', async () => {
-    localStorage.setItem('recipe-finder.refresh-token', 'refresh-token')
     const fetchMock = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(new Response(JSON.stringify({ detail: 'Expired' }), { status: 401 }))
       .mockResolvedValueOnce(
         new Response(
-          JSON.stringify({ access_token: 'new-access', refresh_token: 'new-refresh' }),
+          JSON.stringify({ access_token: 'new-access' }),
           { status: 200, headers: { 'Content-Type': 'application/json' } },
         ),
       )
@@ -28,6 +26,11 @@ describe('API client authentication', () => {
 
     await expect(recipesApi.list()).resolves.toMatchObject({ items: [] })
     expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock.mock.calls[1][1]).toMatchObject({
+      method: 'POST',
+      credentials: 'include',
+    })
+    expect(fetchMock.mock.calls[1][1]?.body).toBeUndefined()
     expect(new Headers(fetchMock.mock.calls[2][1]?.headers).get('Authorization')).toBe(
       'Bearer new-access',
     )
@@ -47,15 +50,15 @@ describe('API client authentication', () => {
   })
 
   it('clears the local session when the logout request fails', async () => {
-    localStorage.setItem('recipe-finder.refresh-token', 'refresh-token')
-    vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(new TypeError('Network unavailable'))
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValueOnce(new TypeError('Network unavailable'))
 
     await expect(authApi.logout()).resolves.toBeUndefined()
-    expect(localStorage.getItem('recipe-finder.refresh-token')).toBeNull()
+    expect(fetchMock).toHaveBeenCalledOnce()
   })
 
   it('notifies the auth layer when token refresh fails', async () => {
-    localStorage.setItem('recipe-finder.refresh-token', 'expired-refresh-token')
     const sessionCleared = vi.fn()
     const unsubscribe = onSessionCleared(sessionCleared)
     vi.spyOn(globalThis, 'fetch')
@@ -69,12 +72,10 @@ describe('API client authentication', () => {
   })
 
   it('stores the rotated token pair after a password change', async () => {
-    localStorage.setItem('recipe-finder.refresh-token', 'old-refresh')
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       new Response(
         JSON.stringify({
           access_token: 'fresh-access',
-          refresh_token: 'fresh-refresh',
           token_type: 'bearer',
           expires_in: 900,
         }),
@@ -89,8 +90,50 @@ describe('API client authentication', () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining('/auth/change-password'),
-      expect.objectContaining({ method: 'POST' }),
+      expect.objectContaining({ method: 'POST', credentials: 'include' }),
     )
-    expect(localStorage.getItem('recipe-finder.refresh-token')).toBe('fresh-refresh')
+  })
+
+  it('restores a session through the cookie-backed refresh endpoint', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ access_token: 'restored-access' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 'user-1', email: 'chef@example.com' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      )
+
+    await expect(authApi.restore()).resolves.toMatchObject({ id: 'user-1' })
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({
+      method: 'POST',
+      credentials: 'include',
+    })
+  })
+
+  it('requests ranked ingredient sets with the selected size', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          item_count: 3,
+          candidate_count: 20,
+          quality_excluded_recipe_count: 0,
+          items: [],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    )
+
+    await pantryApi.unlockSets(3, 7)
+
+    expect(fetchMock.mock.calls[0][0]).toEqual(
+      expect.stringContaining('/pantry/unlock-sets?size=3&limit=7'),
+    )
   })
 })

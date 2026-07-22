@@ -117,7 +117,7 @@ def test_duplicate_extractions_are_removed_without_dropping_distinct_recipes() -
 
 
 @pytest.mark.asyncio
-async def test_resolve_ingredient_reuses_and_enriches_existing_ingredient() -> None:
+async def test_resolve_ingredient_does_not_merge_llm_taxonomy_into_shared_row() -> None:
     async with SessionLocal() as db:
         existing = Ingredient(name="salt", aliases=["sea salt"], staple=False)
         db.add(existing)
@@ -134,7 +134,7 @@ async def test_resolve_ingredient_reuses_and_enriches_existing_ingredient() -> N
         )
 
         assert resolved.id == existing.id
-        assert resolved.aliases == ["kosher salt", "sea salt"]
+        assert resolved.aliases == ["sea salt"]
         assert resolved.staple is True
 
 

@@ -133,3 +133,66 @@ async def test_retry_failed_cookbook(client: AsyncClient, tmp_path: Path, monkey
     status = await client.get(f"/api/v1/cookbooks/{cookbook_id}", headers=headers)
     assert status.status_code == 200
     assert status.json()["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_update_cookbook_enabled_state(client: AsyncClient) -> None:
+    headers = await _auth_headers(client, email="enabled@example.com")
+
+    from sqlalchemy import select
+
+    from app.db.session import SessionLocal
+    from app.models import Cookbook, User
+
+    async with SessionLocal() as db:
+        user = await db.scalar(select(User).where(User.email == "enabled@example.com"))
+        assert user is not None
+        book = Cookbook(
+            user_id=user.id,
+            title="Toggle Book",
+            original_filename="toggle.pdf",
+            content_type="application/pdf",
+            storage_path="/tmp/toggle.pdf",
+            status=UploadStatus.completed,
+        )
+        db.add(book)
+        await db.commit()
+        await db.refresh(book)
+        cookbook_id = str(book.id)
+
+    updated = await client.patch(
+        f"/api/v1/cookbooks/{cookbook_id}",
+        headers=headers,
+        json={"enabled": False},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["enabled"] is False
+
+    listed = await client.get("/api/v1/cookbooks", headers=headers)
+    assert listed.status_code == 200
+    assert listed.json()[0]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_upload_cleans_file_when_database_setup_fails(
+    client: AsyncClient, tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "upload_dir", tmp_path)
+
+    async def fail_catalog(*args, **kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        "app.api.routes.cookbooks.find_or_create_catalog_cookbook",
+        fail_catalog,
+    )
+    headers = await _auth_headers(client, email="cleanup@example.com")
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await client.post(
+            "/api/v1/cookbooks",
+            headers=headers,
+            files={"file": ("cleanup.pdf", TINY_PDF, "application/pdf")},
+        )
+
+    assert list(tmp_path.glob("*.pdf")) == []

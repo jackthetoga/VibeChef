@@ -445,7 +445,7 @@ async def tag_recipe_llm(
     steps: list[str] | None = None,
 ) -> TagAssignment:
     """Ask the LLM for allowlisted tags. Returns empty assignment on failure."""
-    if not settings.openai_api_key:
+    if not settings.llm_enabled:
         return TagAssignment()
 
     ingredients = ", ".join((ingredient_names or [])[:40]) or "(none)"

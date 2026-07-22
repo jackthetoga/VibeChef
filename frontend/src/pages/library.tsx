@@ -4,6 +4,8 @@ import {
   AlertTriangle,
   BookOpen,
   CheckCircle2,
+  Eye,
+  EyeOff,
   FileUp,
   LoaderCircle,
   RefreshCw,
@@ -118,6 +120,20 @@ export function LibraryPage() {
     onSuccess: () => {
       toast.success('Reingest started')
       void client.invalidateQueries({ queryKey: ['cookbooks'] })
+    },
+    onError: (error) => toast.error(error.message),
+  })
+  const toggleEnabled = useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
+      cookbooksApi.setEnabled(id, enabled),
+    onSuccess: (book) => {
+      toast.success(
+        book.enabled
+          ? 'Cookbook included in ingredient suggestions'
+          : 'Cookbook excluded from ingredient suggestions',
+      )
+      void client.invalidateQueries({ queryKey: ['cookbooks'] })
+      void client.invalidateQueries({ queryKey: ['pantry', 'suggestions'] })
     },
     onError: (error) => toast.error(error.message),
   })
@@ -247,17 +263,34 @@ export function LibraryPage() {
                         </Button>
                       </div>
                     ) : (
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="flex items-center gap-1.5 text-xs font-bold text-leaf-dark"><CheckCircle2 className="size-4" /> Ready to cook</p>
-                        <Button
-                          size="sm"
-                          variant="secondary"
-                          disabled={retry.isPending}
-                          onClick={() => retry.mutate(book.id)}
-                        >
-                          <RefreshCw className={`size-3.5 ${retry.isPending ? 'animate-spin' : ''}`} />
-                          Reingest
-                        </Button>
+                      <div className="grid gap-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <p className="flex items-center gap-1.5 text-xs font-bold text-leaf-dark"><CheckCircle2 className="size-4" /> Ready to cook</p>
+                          <Badge tone={book.enabled ? 'green' : 'neutral'}>
+                            {book.enabled ? 'Suggestions on' : 'Suggestions off'}
+                          </Badge>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            aria-pressed={book.enabled}
+                            disabled={toggleEnabled.isPending}
+                            onClick={() => toggleEnabled.mutate({ id: book.id, enabled: !book.enabled })}
+                          >
+                            {book.enabled ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                            {book.enabled ? 'Exclude suggestions' : 'Include suggestions'}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            disabled={retry.isPending}
+                            onClick={() => retry.mutate(book.id)}
+                          >
+                            <RefreshCw className={`size-3.5 ${retry.isPending ? 'animate-spin' : ''}`} />
+                            Reingest
+                          </Button>
+                        </div>
                       </div>
                     )}
                   </div>

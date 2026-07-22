@@ -5,6 +5,8 @@ import type {
   CommonIngredient,
   CursorPage,
   Ingredient,
+  IngredientUnlock,
+  IngredientUnlockSetPage,
   PantryBulkItem,
   PantryBulkResult,
   PantryConfirmItem,
@@ -24,7 +26,6 @@ import type {
 } from './types'
 
 const API_BASE = (import.meta.env.VITE_API_URL || '/api/v1').replace(/\/$/, '')
-const REFRESH_KEY = 'recipe-finder.refresh-token'
 let accessToken: string | null = null
 let refreshPromise: Promise<string | null> | null = null
 const sessionClearedListeners = new Set<() => void>()
@@ -41,20 +42,12 @@ export class ApiError extends Error {
   }
 }
 
-function storedRefreshToken() {
-  return typeof window === 'undefined' ? null : window.localStorage.getItem(REFRESH_KEY)
-}
-
 function saveTokens(tokens: Partial<AuthTokens>) {
   if (tokens.access_token) accessToken = tokens.access_token
-  if (tokens.refresh_token && typeof window !== 'undefined') {
-    window.localStorage.setItem(REFRESH_KEY, tokens.refresh_token)
-  }
 }
 
 export function clearSession() {
   accessToken = null
-  if (typeof window !== 'undefined') window.localStorage.removeItem(REFRESH_KEY)
   sessionClearedListeners.forEach((listener) => listener())
 }
 
@@ -75,13 +68,10 @@ async function parseError(response: Response) {
 }
 
 async function refreshAccessToken(): Promise<string | null> {
-  const refreshToken = storedRefreshToken()
-  if (!refreshToken) return null
   if (!refreshPromise) {
     refreshPromise = fetch(`${API_BASE}/auth/refresh`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refresh_token: refreshToken }),
+      credentials: 'include',
     })
       .then(async (response) => {
         if (!response.ok) throw await parseError(response)
@@ -113,7 +103,11 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   }
   if (auth && accessToken) requestHeaders.set('Authorization', `Bearer ${accessToken}`)
 
-  const response = await fetch(`${API_BASE}${path}`, { ...init, headers: requestHeaders })
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    credentials: 'include',
+    headers: requestHeaders,
+  })
   if (response.status === 401 && auth && retry) {
     const token = await refreshAccessToken()
     if (token) return request<T>(path, { ...options, retry: false })
@@ -164,19 +158,12 @@ export const authApi = {
   },
   me: () => request<User>('/auth/me'),
   async restore() {
-    if (!storedRefreshToken()) return null
     const token = await refreshAccessToken()
     return token ? request<User>('/auth/me') : null
   },
   async logout() {
-    const refresh_token = storedRefreshToken()
     try {
-      if (refresh_token) {
-        await request<void>('/auth/logout', {
-          method: 'POST',
-          body: JSON.stringify({ refresh_token }),
-        })
-      }
+      await request<void>('/auth/logout', { method: 'POST' })
     } catch {
       // Logging out locally must still succeed when the API is unavailable.
     } finally {
@@ -210,12 +197,14 @@ export const recipesApi = {
     }),
   async imageBlob(id: string) {
     const response = await fetch(`${API_BASE}/recipes/${encodeURIComponent(id)}/image`, {
+      credentials: 'include',
       headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
     })
     if (response.status === 401) {
       const token = await refreshAccessToken()
       if (!token) throw new ApiError('Unauthorized', 401)
       const retry = await fetch(`${API_BASE}/recipes/${encodeURIComponent(id)}/image`, {
+        credentials: 'include',
         headers: { Authorization: `Bearer ${token}` },
       })
       if (!retry.ok) throw await parseError(retry)
@@ -266,12 +255,37 @@ export const reviewsApi = {
       `/catalog/recipes/${encodeURIComponent(catalogRecipeId)}/reviews/me/photos/${encodeURIComponent(photoId)}`,
       { method: 'DELETE' },
     ),
+  async photoBlob(catalogRecipeId: string, photoId: string) {
+    const path = `/catalog/recipes/${encodeURIComponent(catalogRecipeId)}/reviews/photos/${encodeURIComponent(photoId)}`
+    const response = await fetch(`${API_BASE}${path}`, {
+      credentials: 'include',
+      headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
+    })
+    if (response.status === 401) {
+      const token = await refreshAccessToken()
+      if (!token) throw new ApiError('Unauthorized', 401)
+      const retry = await fetch(`${API_BASE}${path}`, {
+        credentials: 'include',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!retry.ok) throw await parseError(retry)
+      return retry.blob()
+    }
+    if (!response.ok) throw await parseError(response)
+    return response.blob()
+  },
 }
 
 export const pantryApi = {
   async list() {
     return page(await request<CursorPage<PantryItem> | PantryItem[]>('/pantry'))
   },
+  suggestions: (limit = 20) =>
+    request<IngredientUnlock[]>(`/pantry/suggestions${queryString({ limit })}`),
+  unlockSets: (size: 1 | 2 | 3, limit = 10) =>
+    request<IngredientUnlockSetPage>(
+      `/pantry/unlock-sets${queryString({ size, limit })}`,
+    ),
   create: (input: PantryInput) =>
     request<PantryItem>('/pantry', { method: 'POST', body: JSON.stringify(input) }),
   createBulk: (items: PantryBulkItem[]) =>
@@ -336,16 +350,23 @@ export const cookbooksApi = {
   get: (id: string) => request<Cookbook>(`/cookbooks/${encodeURIComponent(id)}`),
   retry: (id: string) =>
     request<Cookbook>(`/cookbooks/${encodeURIComponent(id)}/retry`, { method: 'POST' }),
+  setEnabled: (id: string, enabled: boolean) =>
+    request<Cookbook>(`/cookbooks/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled }),
+    }),
   remove: (id: string) =>
     request<void>(`/cookbooks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   async coverBlob(id: string) {
     const response = await fetch(`${API_BASE}/cookbooks/${encodeURIComponent(id)}/cover`, {
+      credentials: 'include',
       headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
     })
     if (response.status === 401) {
       const token = await refreshAccessToken()
       if (!token) throw new ApiError('Unauthorized', 401)
       const retry = await fetch(`${API_BASE}/cookbooks/${encodeURIComponent(id)}/cover`, {
+        credentials: 'include',
         headers: { Authorization: `Bearer ${token}` },
       })
       if (!retry.ok) throw await parseError(retry)

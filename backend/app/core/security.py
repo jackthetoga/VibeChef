@@ -11,6 +11,7 @@ from pwdlib import PasswordHash
 from app.core.config import settings
 
 password_hash = PasswordHash.recommended()
+DUMMY_PASSWORD_HASH = password_hash.hash("recipe-finder-dummy-password")
 
 PASSWORD_MIN_LENGTH = 8
 PASSWORD_MAX_LENGTH = 128
@@ -69,6 +70,8 @@ def create_access_token(user_id: UUID, credentials_version: int = 0) -> tuple[st
             "sub": str(user_id),
             "type": "access",
             "cv": credentials_version,
+            "iss": settings.jwt_issuer,
+            "aud": settings.jwt_audience,
             "exp": expires,
             "iat": datetime.now(UTC),
         },
@@ -90,6 +93,8 @@ def create_refresh_token(
             "jti": jti,
             "type": "refresh",
             "cv": credentials_version,
+            "iss": settings.jwt_issuer,
+            "aud": settings.jwt_audience,
             "exp": expires,
             "iat": datetime.now(UTC),
         },
@@ -101,7 +106,13 @@ def create_refresh_token(
 
 def decode_token(token: str, expected_type: str) -> dict[str, Any]:
     try:
-        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
+        payload = jwt.decode(
+            token,
+            settings.secret_key,
+            algorithms=[settings.jwt_algorithm],
+            issuer=settings.jwt_issuer,
+            audience=settings.jwt_audience,
+        )
     except InvalidTokenError as exc:
         raise ValueError("Invalid or expired token") from exc
     if payload.get("type") != expected_type or not payload.get("sub"):

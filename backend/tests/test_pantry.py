@@ -2,9 +2,10 @@ from decimal import Decimal
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 
 from app.db.session import SessionLocal
-from app.models import Ingredient
+from app.models import Ingredient, PantryItem, User
 
 
 async def auth_headers(client: AsyncClient) -> dict[str, str]:
@@ -429,6 +430,9 @@ async def test_autocomplete_returns_ranked_canonical_roots_only(
         await db.flush()
         pancetta.canonical_id = pancetta.id
         variant.canonical_id = pancetta.id
+        user = await db.scalar(select(User).where(User.email == "pantry@example.com"))
+        assert user is not None
+        db.add(PantryItem(user_id=user.id, ingredient_id=variant.id))
         await db.commit()
 
     generic = await client.get(
@@ -437,6 +441,7 @@ async def test_autocomplete_returns_ranked_canonical_roots_only(
     )
     assert generic.status_code == 200
     assert [item["name"] for item in generic.json()] == ["pancetta"]
+    assert "aliases" not in generic.json()[0]
 
     specific = await client.get(
         "/api/v1/ingredients?query=2%20tablespoons%20chopped%20pancetta",
@@ -444,3 +449,38 @@ async def test_autocomplete_returns_ranked_canonical_roots_only(
     )
     assert specific.status_code == 200
     assert [item["name"] for item in specific.json()] == ["pancetta"]
+
+
+@pytest.mark.asyncio
+async def test_autocomplete_does_not_disclose_other_users_ingredients(
+    client: AsyncClient,
+) -> None:
+    owner_headers = await auth_headers(client)
+    attacker = await client.post(
+        "/api/v1/auth/register",
+        json={"email": "other-pantry@example.com", "password": "password-123"},
+    )
+    attacker_headers = {
+        "Authorization": f"Bearer {attacker.json()['access_token']}"
+    }
+
+    async with SessionLocal() as db:
+        owner = await db.scalar(select(User).where(User.email == "pantry@example.com"))
+        assert owner is not None
+        private = Ingredient(name="private saffron blend", aliases=["family secret"])
+        db.add(private)
+        await db.flush()
+        private.canonical_id = private.id
+        db.add(PantryItem(user_id=owner.id, ingredient_id=private.id))
+        await db.commit()
+
+    visible = await client.get(
+        "/api/v1/ingredients?query=private%20saffron",
+        headers=owner_headers,
+    )
+    hidden = await client.get(
+        "/api/v1/ingredients?query=private%20saffron",
+        headers=attacker_headers,
+    )
+    assert [item["name"] for item in visible.json()] == ["private saffron blend"]
+    assert hidden.json() == []

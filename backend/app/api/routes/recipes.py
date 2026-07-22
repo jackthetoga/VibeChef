@@ -39,7 +39,7 @@ from app.services.canonicalize import (
     SAUSAGE_NAMES,
     ingredient_match_key,
 )
-from app.services.derivatives import parent_name_candidates
+from app.services.pantry_matching import PantryMatcher, collapse_alternate_groups
 from app.services.pantry_text import apply_quantity_delta
 from app.services.recipe_filters import (
     food_group_tag_candidates,
@@ -55,7 +55,6 @@ from app.services.recipe_images import (
 from app.services.recipe_tagging import apply_manual_tags
 from app.services.units import (
     compare_quantities,
-    ingredient_conversion_for_units,
     normalized_unit_expression,
     quantity_in_grams_expression,
     unit_dimension_expression,
@@ -502,153 +501,16 @@ async def get_recipe(recipe_id: uuid.UUID, db: DB, user: CurrentUser) -> Recipe:
     recipe.makeable = recipe.missing_count == 0
     recipe.image_url = recipe_image_url(recipe.id, recipe.image_path)
     recipe.image_source = recipe.image_source.value if recipe.image_source else None
-    pantry_items = {
-        item.ingredient.canonical_id or item.ingredient_id: item
-        for item in await db.scalars(
+    pantry_items = list(
+        await db.scalars(
             select(PantryItem)
             .options(selectinload(PantryItem.ingredient))
             .where(PantryItem.user_id == user.id)
         )
-    }
-    pantry_by_name = {
-        " ".join(item.ingredient.name.lower().split()): item for item in pantry_items.values()
-    }
-    pantry_by_match_key = {
-        ingredient_match_key(item.ingredient.name): item for item in pantry_items.values()
-    }
-
-    def resolve_pantry_item(item: RecipeIngredient):
-        match_key = item.ingredient.canonical_id or item.ingredient_id
-        pantry_item = pantry_items.get(match_key)
-        if pantry_item is not None:
-            return pantry_item, None
-        pantry_item = pantry_by_match_key.get(ingredient_match_key(item.ingredient.name))
-        if pantry_item is not None:
-            return pantry_item, None
-        for candidate in parent_name_candidates(item.ingredient.name):
-            pantry_item = pantry_by_name.get(candidate)
-            if pantry_item is not None:
-                return pantry_item, pantry_item.ingredient.name
-            for pantry_candidate in pantry_items.values():
-                pantry_name = " ".join(pantry_candidate.ingredient.name.lower().split())
-                if pantry_name == candidate or pantry_name.rstrip("s") == candidate.rstrip("s"):
-                    return pantry_candidate, pantry_candidate.ingredient.name
-        return None, None
-
-    def ingredient_match(item: RecipeIngredient) -> dict[str, object]:
-        pantry_item, matched_via_parent = resolve_pantry_item(item)
-        conversion_name = matched_via_parent or item.ingredient.name
-        conversion_profile = (
-            ingredient_conversion_for_units(
-                pantry_item.unit,
-                item.unit,
-                conversion_name,
-            )
-            if pantry_item
-            else None
-        )
-        if item.ingredient.staple:
-            match_status = "staple"
-        elif pantry_item is None:
-            match_status = "missing"
-        else:
-            comparison = compare_quantities(
-                pantry_item.quantity,
-                pantry_item.unit,
-                item.quantity,
-                item.unit,
-                conversion_name,
-            )
-            if comparison is True:
-                match_status = "available"
-            elif comparison is False:
-                # Derivatives (zest/juice) from a whole food: any positive parent counts.
-                if matched_via_parent and (
-                    pantry_item.quantity is None or pantry_item.quantity > 0
-                ):
-                    match_status = "available"
-                else:
-                    match_status = "insufficient"
-            else:
-                # Unknown unit pairing for a derivative → treat as available if parent is on hand.
-                if matched_via_parent:
-                    match_status = "available"
-                else:
-                    match_status = "unknown"
-        matched_via = matched_via_parent
-        if (
-            matched_via is None
-            and pantry_item is not None
-            and pantry_item.ingredient.name != item.ingredient.name
-        ):
-            matched_via = pantry_item.ingredient.name
-        return {
-            "id": item.id,
-            "ingredient_id": item.ingredient_id,
-            "name": item.ingredient.name,
-            "quantity": item.quantity,
-            "unit": item.unit,
-            "preparation": None,
-            "raw_text": item.raw_text,
-            "section": item.section,
-            "alternate_group_id": item.alternate_group_id,
-            "in_pantry": match_status not in {"missing", "insufficient"},
-            "match_status": match_status,
-            "pantry_quantity": pantry_item.quantity if pantry_item else None,
-            "pantry_unit": pantry_item.unit if pantry_item else None,
-            "matched_via": matched_via,
-            "conversion_basis": conversion_profile.basis if conversion_profile else None,
-            "conversion_source": conversion_profile.source_url if conversion_profile else None,
-            "alternates": None,
-        }
-
-    def collapse_or_groups(
-        matched: list[dict[str, object]],
-    ) -> list[dict[str, object]]:
-        """Collapse OR alternates into one display row with ANY match semantics."""
-        groups: dict[object, list[dict[str, object]]] = {}
-        order: list[object] = []
-        for row in matched:
-            key = row.get("alternate_group_id") or row["id"]
-            if key not in groups:
-                groups[key] = []
-                order.append(key)
-            groups[key].append(row)
-
-        collapsed: list[dict[str, object]] = []
-        for key in order:
-            members = groups[key]
-            if len(members) == 1 or members[0].get("alternate_group_id") is None:
-                collapsed.append(members[0])
-                continue
-            status_rank = {
-                "available": 0,
-                "staple": 1,
-                "unknown": 2,
-                "insufficient": 3,
-                "missing": 4,
-            }
-            best = min(members, key=lambda row: status_rank.get(str(row["match_status"]), 9))
-            names = [str(member["name"]) for member in members]
-            display = best.copy()
-            display["name"] = " or ".join(names)
-            display["match_status"] = best["match_status"]
-            display["in_pantry"] = best["match_status"] not in {"missing", "insufficient"}
-            display["alternates"] = [
-                {
-                    "ingredient_id": member["ingredient_id"],
-                    "name": member["name"],
-                    "quantity": member["quantity"],
-                    "unit": member["unit"],
-                    "match_status": member["match_status"],
-                }
-                for member in members
-            ]
-            collapsed.append(display)
-        return collapsed
-
-    recipe.ingredients = collapse_or_groups(
-        [ingredient_match(item) for item in recipe.recipe_ingredients]
+    )
+    matcher = PantryMatcher(pantry_items)
+    recipe.ingredients = collapse_alternate_groups(
+        [matcher.response_row(item) for item in recipe.recipe_ingredients]
     )
     recipe.parse_warnings = list(recipe.parse_warnings or [])
     recipe.nutrition = nutrition_out(recipe)
@@ -747,6 +609,7 @@ async def cook_recipe(
             select(PantryItem)
             .options(selectinload(PantryItem.ingredient))
             .where(PantryItem.user_id == user.id)
+            .with_for_update()
         )
     )
     pantry_by_canonical: dict[object, PantryItem] = {}

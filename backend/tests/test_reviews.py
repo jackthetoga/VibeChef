@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from httpx import AsyncClient
+from PIL import Image
 from sqlalchemy import select
 
 from app.core.config import settings
@@ -21,6 +23,12 @@ from app.services.ingestion import ExtractedIngredient, ExtractedRecipe
 
 TINY_PDF_A = b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n"
 TINY_PDF_B = b"%PDF-1.4\n2 0 obj<< /Type /Catalog >>endobj\ntrailer<<>>\n%%EOF\n"
+
+
+def _jpeg_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (4, 4), color=(180, 60, 20)).save(output, format="JPEG")
+    return output.getvalue()
 
 
 def _fingerprint_for(title: str = "Tomato Soup") -> str:
@@ -329,8 +337,7 @@ async def test_review_photo_upload(client: AsyncClient, tmp_path: Path, monkeypa
     )
     assert created.status_code == 201
 
-    # Minimal valid-ish JPEG header bytes (not decoded by server beyond content-type).
-    jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 64 + b"\xff\xd9"
+    jpeg = _jpeg_bytes()
     photo = await client.post(
         f"/api/v1/catalog/recipes/{catalog_id}/reviews/me/photos",
         headers=headers,
@@ -341,7 +348,67 @@ async def test_review_photo_upload(client: AsyncClient, tmp_path: Path, monkeypa
     assert len(payload["photos"]) == 1
     photo_url = payload["photos"][0]["url"]
     fetched = await client.get(photo_url)
+    assert fetched.status_code == 401
+    fetched = await client.get(photo_url, headers=headers)
     assert fetched.status_code == 200
+    assert fetched.headers["content-type"].startswith("image/jpeg")
+
+
+@pytest.mark.asyncio
+async def test_review_routes_require_linked_recipe_entitlement(
+    client: AsyncClient, tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "upload_dir", tmp_path)
+    owner_headers = await _register(client, "owner@example.com", "Owner")
+    attacker_headers = await _register(client, "attacker@example.com", "Attacker")
+    _, catalog_id = await _seed_linked_recipe(
+        email="owner@example.com",
+        content_sha256="f" * 64,
+    )
+
+    owner_review = await client.post(
+        f"/api/v1/catalog/recipes/{catalog_id}/reviews",
+        headers=owner_headers,
+        json={"rating": 5},
+    )
+    assert owner_review.status_code == 201
+
+    denied_list = await client.get(
+        f"/api/v1/catalog/recipes/{catalog_id}/reviews",
+        headers=attacker_headers,
+    )
+    denied_create = await client.post(
+        f"/api/v1/catalog/recipes/{catalog_id}/reviews",
+        headers=attacker_headers,
+        json={"rating": 1},
+    )
+    assert denied_list.status_code == 404
+    assert denied_create.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_review_photo_rejects_spoofed_image(
+    client: AsyncClient, tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "upload_dir", tmp_path)
+    headers = await _register(client, "spoof@example.com", "Spoof")
+    _, catalog_id = await _seed_linked_recipe(
+        email="spoof@example.com",
+        content_sha256="1" * 64,
+    )
+    await client.post(
+        f"/api/v1/catalog/recipes/{catalog_id}/reviews",
+        headers=headers,
+        json={"rating": 4},
+    )
+
+    response = await client.post(
+        f"/api/v1/catalog/recipes/{catalog_id}/reviews/me/photos",
+        headers=headers,
+        files={"file": ("fake.jpg", b"<script>alert(1)</script>", "image/jpeg")},
+    )
+
+    assert response.status_code == 415
 
 
 def test_extracted_recipe_fingerprint_matches_helper() -> None:

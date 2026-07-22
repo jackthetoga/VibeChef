@@ -279,7 +279,7 @@ async def resolve_or_alternates(
     if not unique_lines:
         return {}
 
-    if not settings.openai_api_key:
+    if not settings.llm_enabled:
         return {
             line: heuristic_or_alternates(line, fallback_names.get(line, line))
             for line in unique_lines
@@ -378,7 +378,7 @@ async def canonicalize_ingredients(
         root.staple = root.staple or ingredient.staple
         by_name.pop(name, None)
 
-    if not settings.openai_api_key or not by_name:
+    if not settings.llm_enabled or not by_name:
         return
 
     unresolved = list(by_name)

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app.core.config import settings
 from app.services.llm import chat_completion
+from app.services.media_bounds import validate_image_dimensions
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,8 @@ def _heif_to_jpeg(content: bytes) -> tuple[bytes, str]:
     pillow_heif.register_heif_opener()
     try:
         with Image.open(BytesIO(content)) as image:
+            validate_image_dimensions(*image.size)
+            image.load()
             rgb = image.convert("RGB")
             buffer = BytesIO()
             rgb.save(buffer, format="JPEG", quality=90)
@@ -220,7 +223,7 @@ async def scan_groceries_from_image(
     content: bytes,
     media_type: str,
 ) -> list[ScannedGrocery]:
-    if not settings.openai_api_key:
+    if not settings.llm_enabled:
         return demo_scan_items()
 
     schema = json.dumps(ScannedGroceryEnvelope.model_json_schema())
@@ -255,7 +258,7 @@ async def scan_receipt_from_image(
     content: bytes,
     media_type: str,
 ) -> list[ScannedGrocery]:
-    if not settings.openai_api_key:
+    if not settings.llm_enabled:
         return demo_receipt_items()
 
     schema = json.dumps(ScannedGroceryEnvelope.model_json_schema())

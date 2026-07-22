@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.models import ImageSource
+from app.services.media_bounds import validate_epub_archive, validate_pdf_document
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +254,7 @@ def _extract_epub_images_by_title(path: Path) -> dict[str, tuple[bytes, str]]:
     from bs4 import BeautifulSoup
     from ebooklib import epub
 
+    validate_epub_archive(path)
     book = epub.read_epub(str(path), options={"ignore_ncx": True})
     items_by_name: dict[str, object] = {}
     for item in book.get_items():
@@ -340,6 +342,7 @@ def _extract_pdf_page_image(path: Path, source_page: int | None) -> tuple[bytes,
     import fitz
 
     with fitz.open(path) as document:
+        validate_pdf_document(document)
         if source_page > document.page_count:
             return None
         page = document[source_page - 1]
@@ -351,6 +354,8 @@ def _extract_pdf_page_image(path: Path, source_page: int | None) -> tuple[bytes,
             except Exception:
                 continue
             content = extracted.get("image") or b""
+            if len(content) > settings.max_epub_entry_bytes:
+                continue
             if _image_too_small(content):
                 continue
             width = int(extracted.get("width") or 0)

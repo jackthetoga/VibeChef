@@ -7,8 +7,8 @@ export interface User {
 
 export interface AuthTokens {
   access_token: string
-  refresh_token: string
   token_type?: string
+  expires_in?: number
 }
 
 export interface AuthResponse extends AuthTokens {
@@ -174,6 +174,52 @@ export interface PantryItem {
   created_at?: string
 }
 
+export interface UnlockRecipe {
+  id: string
+  title: string
+  image_url?: string | null
+}
+
+export interface IngredientUnlock {
+  ingredient_id: string
+  name: string
+  category?: string | null
+  status: 'missing' | 'insufficient'
+  pantry_item_id?: string | null
+  unlock_count: number
+  near_unlock_count: number
+  unlocked_recipes: UnlockRecipe[]
+}
+
+export interface UnlockSetIngredient {
+  ingredient_id: string
+  name: string
+  family_name: string
+  category?: string | null
+  status: 'missing' | 'insufficient'
+  pantry_item_id?: string | null
+}
+
+export interface UnlockSetRecipe extends UnlockRecipe {
+  covered_by: string[]
+}
+
+export interface IngredientUnlockSet {
+  ingredients: UnlockSetIngredient[]
+  unlock_count: number
+  synergy_count: number
+  incremental_count: number
+  near_unlock_count: number
+  unlocked_recipes: UnlockSetRecipe[]
+}
+
+export interface IngredientUnlockSetPage {
+  item_count: number
+  candidate_count: number
+  quality_excluded_recipe_count: number
+  items: IngredientUnlockSet[]
+}
+
 export interface PantryInput {
   ingredient_id?: string
   ingredient_name?: string
@@ -252,6 +298,7 @@ export interface Cookbook {
   filename?: string
   original_filename?: string
   status: 'pending' | 'processing' | 'completed' | 'failed'
+  enabled: boolean
   progress?: number | null
   recipe_count?: number
   error?: string | null

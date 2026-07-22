@@ -28,6 +28,12 @@ async def test_register_login_refresh_rotation_and_me(client: AsyncClient) -> No
     )
     assert registered.status_code == 201
     first_tokens = registered.json()
+    assert "refresh_token" not in first_tokens
+    first_refresh = client.cookies.get("rf_refresh")
+    assert first_refresh
+    set_cookie = registered.headers["set-cookie"]
+    assert "HttpOnly" in set_cookie
+    assert "SameSite=lax" in set_cookie
 
     me = await client.get(
         "/api/v1/auth/me",
@@ -36,18 +42,22 @@ async def test_register_login_refresh_rotation_and_me(client: AsyncClient) -> No
     assert me.status_code == 200
     assert me.json()["email"] == "chef@example.com"
 
-    rotated = await client.post(
-        "/api/v1/auth/refresh",
-        json={"refresh_token": first_tokens["refresh_token"]},
-    )
+    rotated = await client.post("/api/v1/auth/refresh")
     assert rotated.status_code == 200
-    assert rotated.json()["refresh_token"] != first_tokens["refresh_token"]
+    assert "refresh_token" not in rotated.json()
+    rotated_refresh = client.cookies.get("rf_refresh")
+    assert rotated_refresh and rotated_refresh != first_refresh
 
     reused = await client.post(
         "/api/v1/auth/refresh",
-        json={"refresh_token": first_tokens["refresh_token"]},
+        headers={"Cookie": f"rf_refresh={first_refresh}"},
     )
     assert reused.status_code == 401
+    descendant = await client.post(
+        "/api/v1/auth/refresh",
+        headers={"Cookie": f"rf_refresh={rotated_refresh}"},
+    )
+    assert descendant.status_code == 401
 
     login = await client.post(
         "/api/v1/auth/login",
@@ -64,32 +74,20 @@ async def test_duplicate_email_is_rejected(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_logout_cannot_revoke_another_users_refresh_token(client: AsyncClient) -> None:
-    first = (
-        await client.post(
-            "/api/v1/auth/register",
-            json={"email": "first@example.com", "password": "password-123"},
-        )
-    ).json()
-    second = (
-        await client.post(
-            "/api/v1/auth/register",
-            json={"email": "second@example.com", "password": "password-123"},
-        )
-    ).json()
+async def test_logout_revokes_and_clears_refresh_cookie(client: AsyncClient) -> None:
+    await _register(client, email="logout@example.com")
+    refresh_token = client.cookies.get("rf_refresh")
+    assert refresh_token
 
-    logged_out = await client.post(
-        "/api/v1/auth/logout",
-        headers={"Authorization": f"Bearer {first['access_token']}"},
-        json={"refresh_token": second["refresh_token"]},
-    )
+    logged_out = await client.post("/api/v1/auth/logout")
     assert logged_out.status_code == 200
+    assert client.cookies.get("rf_refresh") is None
 
     refreshed = await client.post(
         "/api/v1/auth/refresh",
-        json={"refresh_token": second["refresh_token"]},
+        headers={"Cookie": f"rf_refresh={refresh_token}"},
     )
-    assert refreshed.status_code == 200
+    assert refreshed.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -122,6 +120,17 @@ async def test_cors_rejects_untrusted_origins(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_refresh_rejects_untrusted_origin(client: AsyncClient) -> None:
+    await _register(client, email="origin@example.com")
+    response = await client.post(
+        "/api/v1/auth/refresh",
+        headers={"Origin": "https://malicious.example"},
+    )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_register_rejects_common_password(client: AsyncClient) -> None:
     response = await client.post(
         "/api/v1/auth/register",
@@ -135,12 +144,15 @@ async def test_change_password_rotates_credentials_and_revokes_other_sessions(
     client: AsyncClient,
 ) -> None:
     first = await _register(client, email="changer@example.com")
+    first_refresh = client.cookies.get("rf_refresh")
+    assert first_refresh
     second_login = await client.post(
         "/api/v1/auth/login",
         json={"email": "changer@example.com", "password": "correct-horse-battery"},
     )
     assert second_login.status_code == 200
-    other_refresh = second_login.json()["refresh_token"]
+    other_refresh = client.cookies.get("rf_refresh")
+    assert other_refresh and other_refresh != first_refresh
 
     changed = await client.post(
         "/api/v1/auth/change-password",
@@ -152,17 +164,18 @@ async def test_change_password_rotates_credentials_and_revokes_other_sessions(
     )
     assert changed.status_code == 200
     new_tokens = changed.json()
-    assert new_tokens["refresh_token"] != first["refresh_token"]
+    assert "refresh_token" not in new_tokens
+    assert client.cookies.get("rf_refresh") not in {first_refresh, other_refresh}
 
     old_refresh = await client.post(
         "/api/v1/auth/refresh",
-        json={"refresh_token": first["refresh_token"]},
+        headers={"Cookie": f"rf_refresh={first_refresh}"},
     )
     assert old_refresh.status_code == 401
 
     other_session = await client.post(
         "/api/v1/auth/refresh",
-        json={"refresh_token": other_refresh},
+        headers={"Cookie": f"rf_refresh={other_refresh}"},
     )
     assert other_session.status_code == 401
 

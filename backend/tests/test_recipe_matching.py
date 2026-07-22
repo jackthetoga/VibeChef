@@ -288,13 +288,12 @@ async def test_pork_sausage_matches_pantry_sausage(client: AsyncClient) -> None:
             )
         )
         await db.commit()
-        sausage_id = sausage.id
         recipe_id = recipe.id
 
     pantry = await client.post(
         "/api/v1/pantry",
         headers=headers,
-        json={"ingredient_id": str(sausage_id), "quantity": 3, "unit": "pieces"},
+        json={"ingredient_name": "sausage", "quantity": 3, "unit": "pieces"},
     )
     assert pantry.status_code == 201
 
@@ -356,15 +355,12 @@ async def test_recipe_onion_matches_yellow_onion_not_red_onion(
             )
         )
         await db.commit()
-        yellow_id = yellow.id
-        white_id = white.id
-        red_id = red.id
         recipe_id = recipe.id
 
     red_pantry = await client.post(
         "/api/v1/pantry",
         headers=headers,
-        json={"ingredient_id": str(red_id), "quantity": 3, "unit": "pieces"},
+        json={"ingredient_name": "red onion", "quantity": 3, "unit": "pieces"},
     )
     assert red_pantry.status_code == 201
 
@@ -378,7 +374,7 @@ async def test_recipe_onion_matches_yellow_onion_not_red_onion(
     yellow_pantry = await client.post(
         "/api/v1/pantry",
         headers=headers,
-        json={"ingredient_id": str(yellow_id), "quantity": 2.5, "unit": "pieces"},
+        json={"ingredient_name": "yellow onion", "quantity": 2.5, "unit": "pieces"},
     )
     assert yellow_pantry.status_code == 201
 
@@ -395,7 +391,7 @@ async def test_recipe_onion_matches_yellow_onion_not_red_onion(
     white_pantry = await client.post(
         "/api/v1/pantry",
         headers=headers,
-        json={"ingredient_id": str(white_id), "quantity": 1, "unit": "piece"},
+        json={"ingredient_name": "white onion", "quantity": 1, "unit": "piece"},
     )
     assert white_pantry.status_code == 201
 
@@ -493,7 +489,6 @@ async def test_lemon_zest_matches_pantry_lemon(client: AsyncClient) -> None:
             )
         )
         await db.commit()
-        lemon_id = lemon.id
         recipe_id = recipe.id
 
     before = await client.get(f"/api/v1/recipes/{recipe_id}", headers=headers)
@@ -503,7 +498,7 @@ async def test_lemon_zest_matches_pantry_lemon(client: AsyncClient) -> None:
     pantry = await client.post(
         "/api/v1/pantry",
         headers=headers,
-        json={"ingredient_id": str(lemon_id), "quantity": 2, "unit": "pieces"},
+        json={"ingredient_name": "lemon", "quantity": 2, "unit": "pieces"},
     )
     assert pantry.status_code == 201
 

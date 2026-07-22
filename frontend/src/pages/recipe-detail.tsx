@@ -150,6 +150,42 @@ function cookToast(result: { updated: unknown[]; removed: string[]; skipped: str
   }
 }
 
+function ReviewPhotoImage({
+  catalogRecipeId,
+  photoId,
+  alt,
+  className,
+}: {
+  catalogRecipeId: string
+  photoId: string
+  alt: string
+  className: string
+}) {
+  const [src, setSrc] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    let objectUrl: string | null = null
+    void reviewsApi
+      .photoBlob(catalogRecipeId, photoId)
+      .then((blob) => {
+        if (cancelled) return
+        objectUrl = URL.createObjectURL(blob)
+        setSrc(objectUrl)
+      })
+      .catch(() => {
+        if (!cancelled) setSrc(null)
+      })
+    return () => {
+      cancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [catalogRecipeId, photoId])
+
+  if (!src) return <Skeleton className={className} />
+  return <img src={src} alt={alt} className={className} />
+}
+
 export function RecipeDetailPage() {
   const { recipeId } = useParams({ strict: false }) as { recipeId?: string }
   const client = useQueryClient()
@@ -720,8 +756,9 @@ export function RecipeDetailPage() {
               <div className="flex flex-wrap gap-3">
                 {(myReview.data.photos || []).map((photo) => (
                   <div key={photo.id} className="relative">
-                    <img
-                      src={photo.url}
+                    <ReviewPhotoImage
+                      catalogRecipeId={data.catalog_recipe_id!}
+                      photoId={photo.id}
                       alt="Your review"
                       className="size-20 rounded-xl object-cover"
                     />
@@ -801,9 +838,10 @@ export function RecipeDetailPage() {
                 {review.photos?.length > 0 && (
                   <div className="mt-3 flex flex-wrap gap-2">
                     {review.photos.map((photo) => (
-                      <img
+                      <ReviewPhotoImage
                         key={photo.id}
-                        src={photo.url}
+                        catalogRecipeId={data.catalog_recipe_id!}
+                        photoId={photo.id}
                         alt=""
                         className="size-24 rounded-xl object-cover"
                       />

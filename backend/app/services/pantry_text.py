@@ -221,7 +221,7 @@ def parse_pantry_text_rules(text: str) -> list[ParsedPantryChange]:
 
 
 async def parse_pantry_text_llm(text: str) -> list[ParsedPantryChange] | None:
-    if not settings.openai_api_key:
+    if not settings.llm_enabled:
         return None
     prompt = (
         "Parse a home cook's fridge/pantry inventory note into structured changes.\n"

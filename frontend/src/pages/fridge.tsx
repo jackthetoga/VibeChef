@@ -1,9 +1,11 @@
 import { useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
 import {
   CalendarDays,
   Camera,
   Check,
+  ChefHat,
   NotebookPen,
   Pencil,
   Plus,
@@ -19,6 +21,7 @@ import { ingredientsApi, pantryApi } from '../lib/api/client'
 import type {
   CursorPage,
   Ingredient,
+  IngredientUnlockSet,
   PantryBulkItem,
   PantryConfirmItem,
   PantryConfirmResult,
@@ -26,6 +29,7 @@ import type {
   PantryInput,
   PantryItem,
   PantryScanItem,
+  UnlockSetIngredient,
 } from '../lib/api/types'
 import { formatDate, useDebouncedValue } from '../lib/utils'
 import { formatQuantity, UNIT_GROUPS } from '../lib/units'
@@ -105,9 +109,14 @@ export function FridgePage() {
   const [editUnit, setEditUnit] = useState('')
   const [editExpiry, setEditExpiry] = useState('')
   const [editError, setEditError] = useState('')
+  const [unlockSize, setUnlockSize] = useState<1 | 2 | 3>(1)
   const debouncedIngredient = useDebouncedValue(ingredientQuery.trim(), 250)
 
   const pantry = useQuery({ queryKey: ['pantry'], queryFn: pantryApi.list })
+  const unlocks = useQuery({
+    queryKey: ['pantry', 'unlock-sets', unlockSize],
+    queryFn: () => pantryApi.unlockSets(unlockSize, 10),
+  })
   const commonIngredients = useQuery({
     queryKey: ['ingredients', 'common'],
     queryFn: ingredientsApi.common,
@@ -198,6 +207,32 @@ export function FridgePage() {
       setCommonQuantities({})
       setCommonUnits({})
       setCommonQuery('')
+    },
+    onSettled: () => {
+      void client.invalidateQueries({ queryKey: ['pantry'] })
+      void client.invalidateQueries({ queryKey: ['recipes'] })
+      void client.invalidateQueries({ queryKey: ['recipe'] })
+    },
+  })
+
+  const addUnlockSet = useMutation({
+    mutationFn: ({
+      items,
+    }: {
+      set: IngredientUnlockSet
+      items: PantryBulkItem[]
+    }) => pantryApi.createBulk(items),
+    onError: (error) => toast.error(error.message),
+    onSuccess: (result, variables) => {
+      toast.success(
+        result.added.length === 1
+          ? 'Added 1 recommended ingredient'
+          : `Added ${result.added.length} recommended ingredients`,
+      )
+      const topUp = variables.set.ingredients.find(
+        (ingredient) => ingredient.status === 'insufficient',
+      )
+      if (topUp) openUnlockSuggestion(topUp)
     },
     onSettled: () => {
       void client.invalidateQueries({ queryKey: ['pantry'] })
@@ -369,6 +404,37 @@ export function FridgePage() {
     setEditUnit(item.unit || '')
     setEditExpiry((item.expires_at || item.expiry_date || '').slice(0, 10))
     setEditError('')
+  }
+
+  const openUnlockSuggestion = (suggestion: UnlockSetIngredient) => {
+    if (suggestion.status === 'insufficient' && suggestion.pantry_item_id) {
+      const pantryItem = pantry.data?.items.find((item) => item.id === suggestion.pantry_item_id)
+      if (pantryItem) {
+        startEditing(pantryItem)
+        return
+      }
+    }
+    setSelected({
+      id: suggestion.ingredient_id,
+      name: suggestion.name,
+      category: suggestion.category,
+    })
+    setIngredientQuery(suggestion.name)
+    setPreferredCategory(suggestion.category || null)
+    setFormError('')
+    setOpen(true)
+  }
+
+  const applyUnlockSet = (set: IngredientUnlockSet) => {
+    const missing = set.ingredients
+      .filter((ingredient) => ingredient.status === 'missing')
+      .map((ingredient) => ({ name: ingredient.name }))
+    if (missing.length) {
+      addUnlockSet.mutate({ set, items: missing })
+      return
+    }
+    const topUp = set.ingredients.find((ingredient) => ingredient.status === 'insufficient')
+    if (topUp) openUnlockSuggestion(topUp)
   }
 
   const openAddDialog = (category?: string | null) => {
@@ -561,6 +627,148 @@ export function FridgePage() {
             <p className="mt-1 text-sm text-white/75">Your pantry powers makeable recipe suggestions.</p>
           </div>
         </div>
+      </Card>
+
+      <Card className="mt-6 overflow-hidden">
+        <div className="flex flex-col gap-3 border-b border-line bg-sand/50 p-5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3">
+            <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-leaf/12 text-leaf-dark">
+              <ChefHat className="size-5" />
+            </span>
+            <div>
+              <h2 className="font-display text-xl font-bold text-ink">Unlock more recipes</h2>
+              <p className="text-sm text-muted">Best ingredients to add from your enabled cookbooks.</p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="inline-flex rounded-xl border border-line bg-white p-1">
+              {([1, 2, 3] as const).map((size) => (
+                <button
+                  key={size}
+                  type="button"
+                  aria-pressed={unlockSize === size}
+                  className={`rounded-lg px-3 py-1.5 text-xs font-bold transition ${
+                    unlockSize === size ? 'bg-sage text-white' : 'text-muted hover:bg-sand'
+                  }`}
+                  onClick={() => setUnlockSize(size)}
+                >
+                  {size} item{size === 1 ? '' : 's'}
+                </button>
+              ))}
+            </div>
+            {unlocks.data?.items.length ? (
+              <Badge tone="green">{unlocks.data.items.length} suggestions</Badge>
+            ) : null}
+          </div>
+        </div>
+        {unlocks.isLoading ? (
+          <div className="grid gap-3 p-5">
+            {[1, 2, 3].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}
+          </div>
+        ) : unlocks.isError ? (
+          <div className="p-5 text-sm text-muted">
+            Suggestions didn’t load.{' '}
+            <button className="font-bold text-sage-dark hover:underline" onClick={() => void unlocks.refetch()}>
+              Try again
+            </button>
+          </div>
+        ) : unlocks.data?.items.length ? (
+          <div>
+            <ol className="divide-y divide-line">
+              {unlocks.data.items.map((set, index) => (
+                <li
+                  key={set.ingredients.map((ingredient) => ingredient.ingredient_id).join(':')}
+                  className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:px-5"
+                >
+                  <span className="grid size-8 shrink-0 place-items-center rounded-full bg-sand text-sm font-bold text-muted">
+                    {index + 1}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      {set.ingredients.map((ingredient, ingredientIndex) => (
+                        <span key={ingredient.ingredient_id} className="contents">
+                          {ingredientIndex > 0 && <span className="font-bold text-muted">+</span>}
+                          <button
+                            type="button"
+                            className="font-bold capitalize text-ink hover:text-sage-dark hover:underline"
+                            onClick={() => openUnlockSuggestion(ingredient)}
+                          >
+                            {ingredient.name}
+                          </button>
+                          {ingredient.status === 'insufficient' && (
+                            <Badge tone="amber">Top up</Badge>
+                          )}
+                        </span>
+                      ))}
+                      {set.unlock_count > 0 ? (
+                        <Badge tone="green">
+                          Unlocks {set.unlock_count} recipe{set.unlock_count === 1 ? '' : 's'}
+                        </Badge>
+                      ) : (
+                        <Badge>
+                          Helps with {set.near_unlock_count} recipe{set.near_unlock_count === 1 ? '' : 's'}
+                        </Badge>
+                      )}
+                      {set.synergy_count > 0 && unlockSize > 1 && (
+                        <Badge tone="amber">{set.synergy_count} need the full set</Badge>
+                      )}
+                    </div>
+                    {set.unlocked_recipes.length > 0 && (
+                      <p className="mt-1 truncate text-xs text-muted">
+                        {set.unlocked_recipes.map((recipe, recipeIndex) => (
+                          <span key={recipe.id}>
+                            {recipeIndex > 0 && ' · '}
+                            <Link
+                              to="/recipes/$recipeId"
+                              params={{ recipeId: recipe.id }}
+                              className="hover:text-ink hover:underline"
+                            >
+                              {recipe.title}
+                            </Link>
+                          </span>
+                        ))}
+                      </p>
+                    )}
+                    {set.unlock_count > 0 && set.near_unlock_count > 0 && (
+                      <p className="mt-1 text-xs text-muted">
+                        Also gets you closer to {set.near_unlock_count} more.
+                      </p>
+                    )}
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    disabled={addUnlockSet.isPending}
+                    onClick={() => (
+                      unlockSize === 1
+                        ? openUnlockSuggestion(set.ingredients[0])
+                        : applyUnlockSet(set)
+                    )}
+                  >
+                    {unlockSize === 1
+                      ? set.ingredients[0].status === 'insufficient'
+                        ? 'Update amount'
+                        : 'Add to fridge'
+                      : set.ingredients.some((ingredient) => ingredient.status === 'missing')
+                        ? 'Add all'
+                        : 'Review amounts'}
+                  </Button>
+                </li>
+              ))}
+            </ol>
+            {unlocks.data.quality_excluded_recipe_count > 0 && (
+              <p className="border-t border-line bg-sand/40 px-5 py-3 text-xs text-muted">
+                {unlocks.data.quality_excluded_recipe_count} recipe
+                {unlocks.data.quality_excluded_recipe_count === 1 ? ' was' : 's were'} excluded
+                because an ingredient could not be parsed reliably.
+              </p>
+            )}
+          </div>
+        ) : (
+          <p className="p-5 text-sm text-muted">
+            No additions to recommend yet. Enable a completed cookbook or keep your pantry current.
+          </p>
+        )}
       </Card>
 
       {(pantry.data?.items.length || 0) > 0 && (

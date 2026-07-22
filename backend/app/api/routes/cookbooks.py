@@ -18,9 +18,10 @@ from sqlalchemy import func, select
 from app.api.deps import DB, CurrentUser
 from app.core.config import settings
 from app.models import Cookbook, Recipe, UploadStatus
-from app.schemas.api import CookbookOut, Message
+from app.schemas.api import CookbookOut, CookbookUpdate, Message
 from app.services.catalog import find_or_create_catalog_cookbook
 from app.services.ingestion import cover_media_type, process_cookbook
+from app.services.rate_limits import enforce_rate_limit
 from app.services.recipe_images import delete_cookbook_recipe_images
 
 router = APIRouter(prefix="/cookbooks", tags=["cookbooks"])
@@ -99,6 +100,18 @@ def resolve_cover_file(cover_path: str) -> Path:
     return candidate
 
 
+def resolve_cookbook_upload_file(storage_path: str) -> Path:
+    upload_root = settings.upload_dir.resolve()
+    candidate = Path(storage_path).resolve()
+    try:
+        candidate.relative_to(upload_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Cookbook file not found") from exc
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Cookbook file not found")
+    return candidate
+
+
 async def enqueue_ingestion(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -158,6 +171,30 @@ async def upload_cookbook(
     file: UploadFile = File(...),
     title: str | None = Form(default=None),
 ) -> Cookbook:
+    await enforce_rate_limit(
+        request,
+        scope="cookbook-upload",
+        identity=str(user.id),
+        limit=settings.upload_rate_limit_per_hour,
+        window_seconds=60 * 60,
+        fail_closed=True,
+    )
+    active_ingestions = int(
+        await db.scalar(
+            select(func.count(Cookbook.id)).where(
+                Cookbook.user_id == user.id,
+                Cookbook.status.in_([UploadStatus.pending, UploadStatus.processing]),
+            )
+        )
+        or 0
+    )
+    if active_ingestions >= settings.max_active_ingestions_per_user:
+        raise HTTPException(
+            status_code=429,
+            detail="Wait for the current cookbook ingestion to finish before uploading another",
+            headers={"Retry-After": "60"},
+        )
+
     original = Path(file.filename or "cookbook")
     suffix = original.suffix.lower()
     content_type = (file.content_type or "application/octet-stream").lower()
@@ -203,18 +240,26 @@ async def upload_cookbook(
 
     content_sha256 = digest.hexdigest()
     cookbook_title = (title or original.stem).strip()[:255] or "Untitled cookbook"
-    await find_or_create_catalog_cookbook(db, content_sha256=content_sha256, title=cookbook_title)
-
-    cookbook = Cookbook(
-        user_id=user.id,
-        title=cookbook_title,
-        original_filename=original.name[:255],
-        content_type=CONTENT_TYPE_BY_SUFFIX[suffix],
-        storage_path=str(destination.resolve()),
-        content_sha256=content_sha256,
-    )
-    db.add(cookbook)
-    await db.commit()
+    try:
+        await find_or_create_catalog_cookbook(
+            db,
+            content_sha256=content_sha256,
+            title=cookbook_title,
+        )
+        cookbook = Cookbook(
+            user_id=user.id,
+            title=cookbook_title,
+            original_filename=original.name[:255],
+            content_type=CONTENT_TYPE_BY_SUFFIX[suffix],
+            storage_path=str(destination.resolve()),
+            content_sha256=content_sha256,
+        )
+        db.add(cookbook)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        destination.unlink(missing_ok=True)
+        raise
     await db.refresh(cookbook)
     cookbook.recipe_count = 0
     with_cover_url(cookbook)
@@ -233,10 +278,26 @@ async def retry_cookbook(
     db: DB,
     user: CurrentUser,
 ) -> Cookbook:
-    cookbook = await owned_cookbook(db, user.id, cookbook_id)
+    await enforce_rate_limit(
+        request,
+        scope="cookbook-retry",
+        identity=str(user.id),
+        limit=settings.upload_rate_limit_per_hour,
+        window_seconds=60 * 60,
+        fail_closed=True,
+    )
+    cookbook = await db.scalar(
+        select(Cookbook)
+        .where(Cookbook.id == cookbook_id, Cookbook.user_id == user.id)
+        .with_for_update()
+    )
+    if cookbook is None:
+        raise HTTPException(status_code=404, detail="Cookbook not found")
     if cookbook.status in {UploadStatus.pending, UploadStatus.processing}:
         raise HTTPException(status_code=409, detail="Cookbook is already being processed")
-    if not Path(cookbook.storage_path).is_file():
+    try:
+        resolve_cookbook_upload_file(cookbook.storage_path)
+    except HTTPException:
         raise HTTPException(status_code=409, detail="Original cookbook file is no longer available")
 
     cookbook.status = UploadStatus.pending
@@ -269,15 +330,34 @@ async def cookbook_status(cookbook_id: uuid.UUID, db: DB, user: CurrentUser) -> 
     return await with_recipe_count(db, cookbook)
 
 
+@router.patch("/{cookbook_id}", response_model=CookbookOut)
+async def update_cookbook(
+    cookbook_id: uuid.UUID,
+    body: CookbookUpdate,
+    db: DB,
+    user: CurrentUser,
+) -> Cookbook:
+    cookbook = await owned_cookbook(db, user.id, cookbook_id)
+    cookbook.enabled = body.enabled
+    await db.commit()
+    await db.refresh(cookbook)
+    return await with_recipe_count(db, cookbook)
+
+
 @router.delete("/{cookbook_id}", response_model=Message)
 async def delete_cookbook(cookbook_id: uuid.UUID, db: DB, user: CurrentUser) -> Message:
     cookbook = await owned_cookbook(db, user.id, cookbook_id)
-    storage_path = Path(cookbook.storage_path)
+    storage_path: Path | None
+    try:
+        storage_path = resolve_cookbook_upload_file(cookbook.storage_path)
+    except HTTPException:
+        storage_path = None
     cover_relative = cookbook.cover_path
     cookbook_id_str = str(cookbook.id)
     await db.delete(cookbook)
     await db.commit()
-    storage_path.unlink(missing_ok=True)
+    if storage_path is not None:
+        storage_path.unlink(missing_ok=True)
     if cover_relative:
         try:
             resolve_cover_file(cover_relative).unlink(missing_ok=True)

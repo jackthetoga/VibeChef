@@ -6,7 +6,7 @@ import tailwindcss from '@tailwindcss/vite'
 const apiProxy = {
   '/api': {
     target: process.env.VITE_PROXY_TARGET || 'http://localhost:8000',
-    changeOrigin: true,
+    changeOrigin: false,
   },
 }
 

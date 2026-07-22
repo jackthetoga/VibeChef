@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 async def backfill_canonical_ingredients() -> tuple[int, int]:
-    if not settings.openai_api_key:
+    if not settings.llm_enabled:
         raise RuntimeError("OPENAI_API_KEY is required for ingredient canonicalization")
 
     attempted = 0

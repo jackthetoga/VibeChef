@@ -23,7 +23,13 @@ from app.services.catalog import (
     sha256_file,
     upsert_catalog_recipe,
 )
+from app.services.ingredient_quality import (
+    assign_ingredient_metadata,
+    ingredient_quality_flags,
+    parse_status_for_flags,
+)
 from app.services.llm import chat_completion
+from app.services.media_bounds import validate_epub_archive, validate_pdf_document
 from app.services.nutrition import apply_printed_nutrition_metadata
 from app.services.recipe_tagging import assign_recipe_tags
 
@@ -84,11 +90,20 @@ INGREDIENT_DESCRIPTORS = frozenset(
     {
         "black",
         "boiling",
+        "bottled",
         "brown",
+        "baby",
         "cleaned",
         "crusted",
+        "dry",
+        "choice",
+        "coarse",
+        "coarsely",
+        "fine",
+        "finely",
         "firm",
         "fresh",
+        "frozen",
         "good",
         "green",
         "hot",
@@ -96,6 +111,7 @@ INGREDIENT_DESCRIPTORS = frozenset(
         "italian",
         "juicy",
         "large",
+        "long",
         "lean",
         "meaty",
         "medium",
@@ -115,6 +131,7 @@ INGREDIENT_DESCRIPTORS = frozenset(
         "thick",
         "toasting",
         "unshelled",
+        "unflavored",
         "waxy",
         "white",
         "whole",
@@ -266,7 +283,7 @@ def _normalize_amount_text(value: str) -> str:
     for glyph, ascii_frac in _UNICODE_FRACTIONS.items():
         text = re.sub(rf"(\d){re.escape(glyph)}", rf"\1 {ascii_frac}", text)
         text = text.replace(glyph, ascii_frac)
-    return text
+    return re.sub(r"\s*/\s*", "/", text)
 
 
 def parse_number(value: str) -> Decimal | None:
@@ -332,10 +349,26 @@ def _segment_is_descriptor_only(segment: str) -> bool:
 def _ingredient_name_from_remainder(remainder: str) -> str:
     """Keep comma-separated descriptors until the actual ingredient noun appears."""
     remainder = re.sub(r"\([^)]*\)", "", remainder).strip()
+    remainder = re.sub(r"(?i)^\d+(?:\.\d+)?%\s*", "", remainder).strip()
+    remainder = re.sub(
+        r"(?i)^\d+(?:\.\d+)?\s*-?\s*"
+        r"(?:ounces?|oz|pounds?|lbs?|grams?|g)\b\.?\s*"
+        r"(?:(?:cans?|packages?|packs?|jars?|bottles?)\s+)?",
+        "",
+        remainder,
+    ).strip()
+    # Amount parsing can leave "-inch-thick slices of ..." after consuming "1 1/2".
+    remainder = re.sub(
+        r"(?i)^-?(?:inch|cm|centimeter|mm|millimeter)(?:-thick)?\s+"
+        r"(?:slices?|pieces?)\s+(?:of\s+)?",
+        "",
+        remainder,
+    ).strip()
     # Drop dimensional prefixes: "A 1/2-inch-thick slice of prosciutto" → "prosciutto…"
     remainder = re.sub(
-        r"(?i)^(?:a|an)\s+(?:\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?)-inch(?:-thick)?\s+"
-        r"(?:slice\s+of\s+)?",
+        r"(?i)^(?:(?:a|an)\s+)?"
+        r"(?:\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?)-inch(?:-thick)?\s+"
+        r"(?:(?:slices?|pieces?)\s+(?:of\s+)?)?",
         "",
         remainder,
     ).strip()
@@ -369,6 +402,11 @@ def _ingredient_name_from_remainder(remainder: str) -> str:
     name = re.sub(
         r"(?i)^(?:(?:small|medium|large)(?:\s+to\s+(?:small|medium|large))?|whole|cleaned|"
         r"unshelled)(?:\s+(?:small|medium|large|whole|cleaned|unshelled))*\s+",
+        "",
+        name,
+    ).strip()
+    name = re.sub(
+        r"(?i)^(?:fresh|frozen|bottled)\s+or\s+(?:fresh|frozen|bottled)\s+",
         "",
         name,
     ).strip()
@@ -542,13 +580,14 @@ async def resolve_ingredient(db: AsyncSession, extracted: ExtractedIngredient) -
     from app.services.staples import is_staple_name
 
     name = extracted.canonical_name
-    staple = extracted.staple or is_staple_name(name)
+    # LLM output is untrusted and must not mutate the shared ingredient taxonomy.
+    staple = is_staple_name(name)
     ingredient = await db.scalar(select(Ingredient).where(func.lower(Ingredient.name) == name))
     if ingredient is None:
         candidate = Ingredient(
             name=name,
-            aliases=extracted.aliases,
-            category=extracted.category,
+            aliases=[],
+            category=None,
             staple=staple,
         )
         try:
@@ -563,9 +602,7 @@ async def resolve_ingredient(db: AsyncSession, extracted: ExtractedIngredient) -
             if ingredient is None:
                 raise RuntimeError(f"Ingredient creation conflicted but {name!r} was not found")
 
-    ingredient.aliases = sorted(set(ingredient.aliases + extracted.aliases))
     ingredient.staple = ingredient.staple or staple
-    ingredient.category = ingredient.category or extracted.category
     return ingredient
 
 
@@ -1341,6 +1378,7 @@ def extract_structured_epub_recipes(path: Path) -> list[ExtractedRecipe] | None:
         return None
     from ebooklib import epub
 
+    validate_epub_archive(path)
     book = epub.read_epub(str(path), options={"ignore_ncx": True})
     documents = list(_iter_epub_documents(book))
 
@@ -1398,14 +1436,22 @@ def extract_sections(path: Path) -> list[str]:
         import fitz
 
         with fitz.open(path) as document:
-            return [
-                f"[PAGE {index + 1}]\n{page.get_text('text')}".strip()
-                for index, page in enumerate(document)
-                if page.get_text("text").strip()
-            ]
+            validate_pdf_document(document)
+            sections: list[str] = []
+            total_chars = 0
+            for index, page in enumerate(document):
+                text = page.get_text("text").strip()
+                if not text:
+                    continue
+                total_chars += len(text)
+                if total_chars > settings.max_pdf_text_chars:
+                    raise ValueError("PDF text exceeds the configured extraction limit")
+                sections.append(f"[PAGE {index + 1}]\n{text}")
+            return sections
     if path.suffix.lower() == ".epub":
         from ebooklib import epub
 
+        validate_epub_archive(path)
         book = epub.read_epub(str(path), options={"ignore_ncx": True})
         sections: list[str] = []
         for index, item in enumerate(_iter_epub_documents(book), start=1):
@@ -1746,7 +1792,7 @@ def parse_json_response(raw: str) -> ExtractionEnvelope:
 
 
 async def deepseek_parse(chunk: str) -> list[ExtractedRecipe]:
-    if not settings.openai_api_key:
+    if not settings.llm_enabled:
         return demo_parse(chunk)
     schema = json.dumps(ExtractionEnvelope.model_json_schema())
     prompt = (
@@ -1815,6 +1861,7 @@ def extract_epub_cover(path: Path, dest_dir: Path, cookbook_id: str) -> str | No
     import ebooklib
     from ebooklib import epub
 
+    validate_epub_archive(path)
     book = epub.read_epub(str(path), options={"ignore_ncx": True})
     cover_item = None
 
@@ -1857,6 +1904,7 @@ def extract_pdf_cover(path: Path, dest_dir: Path, cookbook_id: str) -> str | Non
     import fitz
 
     with fitz.open(path) as document:
+        validate_pdf_document(document)
         if document.page_count < 1:
             return None
         page = document[0]
@@ -1933,6 +1981,8 @@ async def process_cookbook(cookbook_id: str) -> None:
             if not any(section.strip() for section in sections):
                 raise ValueError("No readable text was found in the cookbook")
             chunks = chunk_sections(sections) or chunk_document("\n\n".join(sections))
+            if len(chunks) > settings.max_ingestion_llm_chunks:
+                raise ValueError("Cookbook requires too many extraction chunks")
             for index, chunk in enumerate(chunks):
                 try:
                     extracted.extend(await deepseek_parse(chunk))
@@ -2050,6 +2100,16 @@ async def process_cookbook(cookbook_id: str) -> None:
                                 position=position,
                                 alternate_group_id=alternate_group_id,
                                 section=extracted_ingredient.section,
+                                parse_status=parse_status_for_flags(
+                                    ingredient_quality_flags(
+                                        ingredient.name,
+                                        extracted_ingredient.raw_text,
+                                    )
+                                ),
+                                quality_flags=ingredient_quality_flags(
+                                    ingredient.name,
+                                    extracted_ingredient.raw_text,
+                                ),
                             )
                         )
                 cookbook.status = UploadStatus.processing
@@ -2075,6 +2135,20 @@ async def process_cookbook(cookbook_id: str) -> None:
                     ingredients,
                     timeout=120.0,
                     raw_hints=raw_hints,
+                )
+                root_ids = {
+                    ingredient.canonical_id
+                    for ingredient in ingredients
+                    if ingredient.canonical_id is not None
+                }
+                roots = list(
+                    await db.scalars(
+                        select(Ingredient).where(Ingredient.id.in_(root_ids))
+                    )
+                )
+                await assign_ingredient_metadata(
+                    db,
+                    list({item.id: item for item in [*ingredients, *roots]}.values()),
                 )
                 await db.commit()
         except Exception:

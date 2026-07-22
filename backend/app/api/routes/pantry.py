@@ -3,17 +3,20 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
-from sqlalchemy import Text, case, cast, func, or_, select
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile, status
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased, selectinload
 
 from app.api.deps import DB, CurrentUser
-from app.models import Ingredient, PantryItem
+from app.core.config import settings
+from app.models import Cookbook, Ingredient, PantryItem, Recipe, RecipeIngredient
 from app.schemas.api import (
     CommonIngredientOut,
     IngredientConversionOut,
     IngredientOut,
+    IngredientUnlockOut,
+    IngredientUnlockSetPage,
     Message,
     PantryBulkCreate,
     PantryBulkOut,
@@ -29,8 +32,6 @@ from app.schemas.api import (
     PantryScanOut,
     PantryUpdate,
 )
-from app.services.canonicalize import canonicalize_ingredients
-from app.services.categorize import CATEGORY_SET, categorize_ingredient
 from app.services.common_ingredients import (
     COMMON_INGREDIENT_CATEGORIES,
     COMMON_INGREDIENT_DEFAULTS,
@@ -44,9 +45,32 @@ from app.services.pantry_vision import (
     scan_groceries_from_image,
     scan_receipt_from_image,
 )
+from app.services.rate_limits import enforce_rate_limit
+from app.services.unlocks import ingredient_unlock_sets, ingredient_unlock_suggestions
 
 ingredient_router = APIRouter(prefix="/ingredients", tags=["ingredients"])
 pantry_router = APIRouter(prefix="/pantry", tags=["pantry"])
+
+
+def visible_ingredient_ids(user_id: uuid.UUID):
+    recipe_ingredients = (
+        select(RecipeIngredient.ingredient_id)
+        .join(Recipe, Recipe.id == RecipeIngredient.recipe_id)
+        .join(Cookbook, Cookbook.id == Recipe.cookbook_id)
+        .where(Cookbook.user_id == user_id)
+    )
+    recipe_roots = (
+        select(Ingredient.canonical_id)
+        .join(RecipeIngredient, RecipeIngredient.ingredient_id == Ingredient.id)
+        .join(Recipe, Recipe.id == RecipeIngredient.recipe_id)
+        .join(Cookbook, Cookbook.id == Recipe.cookbook_id)
+        .where(Cookbook.user_id == user_id, Ingredient.canonical_id.is_not(None))
+    )
+    return (
+        select(PantryItem.ingredient_id)
+        .where(PantryItem.user_id == user_id)
+        .union(recipe_ingredients, recipe_roots)
+    )
 
 
 @ingredient_router.get("/common", response_model=list[CommonIngredientOut])
@@ -84,11 +108,11 @@ async def ingredient_conversions(_: CurrentUser) -> list[IngredientConversionOut
 @ingredient_router.get("/autocomplete", response_model=list[IngredientOut])
 async def autocomplete(
     db: DB,
-    _: CurrentUser,
+    user: CurrentUser,
     q: str | None = Query(default=None, min_length=1, max_length=100),
     query: str | None = Query(default=None, min_length=1, max_length=100),
     limit: int = Query(default=10, ge=1, le=50),
-) -> list[Ingredient]:
+) -> list[IngredientOut]:
     search = q or query
     if not search:
         raise HTTPException(status_code=422, detail="A q or query parameter is required")
@@ -115,10 +139,8 @@ async def autocomplete(
             .join(canonical, canonical.id == candidate.canonical_id)
             .where(
                 canonical.canonical_id == canonical.id,
-                or_(
-                    candidate.name.ilike(term),
-                    cast(candidate.aliases, Text).ilike(term),
-                ),
+                candidate.id.in_(visible_ingredient_ids(user.id)),
+                candidate.name.ilike(term),
             )
             .group_by(canonical.id, canonical.name)
             .order_by(func.min(match_rank), func.lower(canonical.name))
@@ -135,7 +157,13 @@ async def autocomplete(
     )
     by_id = {ingredient.id: ingredient for ingredient in roots}
     return [
-        by_id[root_id]
+        IngredientOut(
+            id=by_id[root_id].id,
+            name=by_id[root_id].name,
+            category=by_id[root_id].category,
+            staple=by_id[root_id].staple,
+            canonical_id=by_id[root_id].canonical_id,
+        )
         for root_id in root_ids
         if root_id in by_id
     ]
@@ -163,44 +191,54 @@ async def list_pantry(db: DB, user: CurrentUser) -> list[PantryItem]:
     return list(result)
 
 
-async def ensure_ingredient_category(
-    ingredient: Ingredient,
-    preferred_category: str | None = None,
-) -> None:
-    if ingredient.category:
-        return
-    if preferred_category:
-        canonical = CATEGORY_SET.get(preferred_category.casefold())
-        if canonical:
-            ingredient.category = canonical
-            return
-    category = await categorize_ingredient(ingredient.name)
-    if category:
-        ingredient.category = category
+@pantry_router.get("/suggestions", response_model=list[IngredientUnlockOut])
+async def list_unlock_suggestions(
+    db: DB,
+    user: CurrentUser,
+    limit: int = Query(default=20, ge=1, le=100),
+) -> list[dict[str, object]]:
+    return await ingredient_unlock_suggestions(db, user_id=user.id, limit=limit)
+
+
+@pantry_router.get("/unlock-sets", response_model=IngredientUnlockSetPage)
+async def list_unlock_sets(
+    db: DB,
+    user: CurrentUser,
+    item_count: int = Query(default=2, alias="size", ge=1, le=3),
+    limit: int = Query(default=10, ge=1, le=50),
+) -> dict[str, object]:
+    return await ingredient_unlock_sets(
+        db,
+        user_id=user.id,
+        item_count=item_count,
+        limit=limit,
+    )
 
 
 @pantry_router.post("", response_model=PantryOut, status_code=status.HTTP_201_CREATED)
 async def add_pantry(body: PantryCreate, db: DB, user: CurrentUser) -> PantryItem:
     if body.ingredient_id:
-        ingredient = await db.get(Ingredient, body.ingredient_id)
+        ingredient = await db.scalar(
+            select(Ingredient).where(
+                Ingredient.id == body.ingredient_id,
+                Ingredient.id.in_(visible_ingredient_ids(user.id)),
+            )
+        )
         if ingredient is None:
             raise HTTPException(status_code=404, detail="Ingredient not found")
-        await ensure_ingredient_category(ingredient, body.category)
     else:
         name = " ".join((body.ingredient_name or "").lower().split())
         ingredient = await db.scalar(select(Ingredient).where(Ingredient.name == name))
         if ingredient is None:
-            preferred = (
-                CATEGORY_SET.get((body.category or "").casefold())
-                if body.category
-                else None
+            candidate = Ingredient(
+                name=name,
+                category=COMMON_INGREDIENT_CATEGORIES.get(name),
             )
-            category = preferred or await categorize_ingredient(name)
-            candidate = Ingredient(name=name, category=category)
             try:
                 async with db.begin_nested():
                     db.add(candidate)
                     await db.flush()
+                    candidate.canonical_id = candidate.id
                 ingredient = candidate
             except IntegrityError:
                 ingredient = await db.scalar(select(Ingredient).where(Ingredient.name == name))
@@ -209,12 +247,6 @@ async def add_pantry(body: PantryCreate, db: DB, user: CurrentUser) -> PantryIte
                         status_code=409,
                         detail="Ingredient could not be created due to a concurrent update",
                     ) from None
-                await ensure_ingredient_category(ingredient, body.category)
-        else:
-            await ensure_ingredient_category(ingredient, body.category)
-
-    if ingredient.canonical_id is None:
-        await canonicalize_ingredients(db, [ingredient], timeout=12.0)
 
     item = PantryItem(
         user_id=user.id,
@@ -248,6 +280,7 @@ async def add_pantry_bulk(body: PantryBulkCreate, db: DB, user: CurrentUser) -> 
     )
     by_name = {ingredient.name.lower(): ingredient for ingredient in ingredients}
 
+    created: list[Ingredient] = []
     for name in names:
         if name not in by_name:
             ingredient = Ingredient(
@@ -256,14 +289,10 @@ async def add_pantry_bulk(body: PantryBulkCreate, db: DB, user: CurrentUser) -> 
             )
             db.add(ingredient)
             by_name[name] = ingredient
-        elif not by_name[name].category:
-            by_name[name].category = COMMON_INGREDIENT_CATEGORIES.get(name)
+            created.append(ingredient)
     await db.flush()
-    await canonicalize_ingredients(
-        db,
-        [ingredient for ingredient in by_name.values() if ingredient.canonical_id is None],
-        timeout=12.0,
-    )
+    for ingredient in created:
+        ingredient.canonical_id = ingredient.id
 
     ingredient_ids = [by_name[name].id for name in names]
     existing_ids = set(
@@ -308,8 +337,19 @@ async def add_pantry_bulk(body: PantryBulkCreate, db: DB, user: CurrentUser) -> 
 
 @pantry_router.post("/from-text", response_model=PantryFromTextOut)
 async def update_pantry_from_text(
-    body: PantryFromTextCreate, db: DB, user: CurrentUser
+    request: Request,
+    body: PantryFromTextCreate,
+    db: DB,
+    user: CurrentUser,
 ) -> PantryFromTextOut:
+    await enforce_rate_limit(
+        request,
+        scope="pantry-text",
+        identity=str(user.id),
+        limit=settings.pantry_ai_rate_limit_per_hour,
+        window_seconds=60 * 60,
+        fail_closed=True,
+    )
     changes = await parse_pantry_text(body.text)
     if not changes:
         raise HTTPException(
@@ -323,6 +363,7 @@ async def update_pantry_from_text(
     )
     by_name = {ingredient.name.lower(): ingredient for ingredient in ingredients}
 
+    created: list[Ingredient] = []
     for change in changes:
         if change.action != "add" or change.name in by_name:
             continue
@@ -332,26 +373,17 @@ async def update_pantry_from_text(
         )
         db.add(ingredient)
         by_name[change.name] = ingredient
+        created.append(ingredient)
     await db.flush()
-    await canonicalize_ingredients(
-        db,
-        [ingredient for ingredient in by_name.values() if ingredient.canonical_id is None],
-        timeout=12.0,
-    )
-
-    for change in changes:
-        if change.action != "add":
-            continue
-        ingredient = by_name[change.name]
-        if not ingredient.category:
-            ingredient.category = COMMON_INGREDIENT_CATEGORIES.get(change.name)
-        await ensure_ingredient_category(ingredient)
+    for ingredient in created:
+        ingredient.canonical_id = ingredient.id
 
     pantry_items = list(
         await db.scalars(
             select(PantryItem)
             .options(selectinload(PantryItem.ingredient))
             .where(PantryItem.user_id == user.id)
+            .with_for_update()
         )
     )
     by_ingredient_id = {item.ingredient_id: item for item in pantry_items}
@@ -489,6 +521,7 @@ async def _resolve_confirm_ingredients(
     )
     by_name = {ingredient.name.lower(): ingredient for ingredient in ingredients}
 
+    created: list[Ingredient] = []
     for name in names:
         if name not in by_name:
             ingredient = Ingredient(
@@ -497,26 +530,28 @@ async def _resolve_confirm_ingredients(
             )
             db.add(ingredient)
             by_name[name] = ingredient
-        elif not by_name[name].category:
-            by_name[name].category = COMMON_INGREDIENT_CATEGORIES.get(name)
+            created.append(ingredient)
     await db.flush()
-    await canonicalize_ingredients(
-        db,
-        [ingredient for ingredient in by_name.values() if ingredient.canonical_id is None],
-        timeout=12.0,
-    )
+    for ingredient in created:
+        ingredient.canonical_id = ingredient.id
 
-    for name in names:
-        await ensure_ingredient_category(by_name[name])
     return by_name
 
 
 @pantry_router.post("/scan", response_model=PantryScanOut)
 async def scan_pantry_photo(
+    request: Request,
     user: CurrentUser,
     file: UploadFile = File(...),
 ) -> PantryScanOut:
-    del user  # auth required; scan is read-only
+    await enforce_rate_limit(
+        request,
+        scope="pantry-vision",
+        identity=str(user.id),
+        limit=settings.pantry_ai_rate_limit_per_hour,
+        window_seconds=60 * 60,
+        fail_closed=True,
+    )
     content, media_type = await _read_pantry_image(file, default_filename="grocery.jpg")
 
     try:
@@ -542,10 +577,18 @@ async def scan_pantry_photo(
 
 @pantry_router.post("/scan-receipt", response_model=PantryScanOut)
 async def scan_pantry_receipt(
+    request: Request,
     user: CurrentUser,
     file: UploadFile = File(...),
 ) -> PantryScanOut:
-    del user  # auth required; scan is read-only
+    await enforce_rate_limit(
+        request,
+        scope="pantry-vision",
+        identity=str(user.id),
+        limit=settings.pantry_ai_rate_limit_per_hour,
+        window_seconds=60 * 60,
+        fail_closed=True,
+    )
     content, media_type = await _read_pantry_image(file, default_filename="receipt.jpg")
 
     try:
@@ -591,6 +634,7 @@ async def confirm_pantry_scan(
                 PantryItem.user_id == user.id,
                 PantryItem.ingredient_id.in_([by_name[name].id for name in names]),
             )
+            .with_for_update()
         )
     )
     by_ingredient_id = {item.ingredient_id: item for item in pantry_items}
@@ -658,6 +702,7 @@ async def confirm_pantry_receipt(
                 PantryItem.user_id == user.id,
                 PantryItem.ingredient_id.in_([by_name[name].id for name in names]),
             )
+            .with_for_update()
         )
     )
     by_ingredient_id = {item.ingredient_id: item for item in pantry_items}

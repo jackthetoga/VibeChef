@@ -24,16 +24,12 @@ from app.schemas.api import (
     ReviewUpdate,
 )
 from app.services.catalog import refresh_catalog_recipe_aggregates
+from app.services.catalog_access import require_catalog_recipe_access
+from app.services.review_images import MAX_REVIEW_PHOTO_BYTES, normalize_review_photo
 
 router = APIRouter(prefix="/catalog/recipes", tags=["reviews"])
 
 MAX_REVIEW_PHOTOS = 5
-MAX_PHOTO_BYTES = 5 * 1024 * 1024
-ALLOWED_PHOTO_TYPES = {
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
-}
 
 
 def review_photo_url(catalog_recipe_id: uuid.UUID, photo_id: uuid.UUID) -> str:
@@ -65,13 +61,6 @@ def serialize_review(review: Review, display_name: str | None = None) -> ReviewO
         created_at=review.created_at,
         updated_at=review.updated_at,
     )
-
-
-async def get_catalog_recipe_or_404(db: DB, catalog_recipe_id: uuid.UUID) -> CatalogRecipe:
-    catalog_recipe = await db.get(CatalogRecipe, catalog_recipe_id)
-    if catalog_recipe is None:
-        raise HTTPException(status_code=404, detail="Catalog recipe not found")
-    return catalog_recipe
 
 
 async def load_review(
@@ -111,8 +100,9 @@ async def get_catalog_recipe(
     db: DB,
     user: CurrentUser,
 ) -> CatalogRecipe:
-    del user
-    return await get_catalog_recipe_or_404(db, catalog_recipe_id)
+    return await require_catalog_recipe_access(
+        db, user_id=user.id, catalog_recipe_id=catalog_recipe_id
+    )
 
 
 @router.get("/{catalog_recipe_id}/reviews", response_model=ReviewPage)
@@ -122,8 +112,9 @@ async def list_reviews(
     user: CurrentUser,
     limit: int = Query(default=20, ge=1, le=50),
 ) -> ReviewPage:
-    del user
-    await get_catalog_recipe_or_404(db, catalog_recipe_id)
+    await require_catalog_recipe_access(
+        db, user_id=user.id, catalog_recipe_id=catalog_recipe_id
+    )
     rows = (
         await db.scalars(
             select(Review)
@@ -142,7 +133,9 @@ async def get_my_review(
     db: DB,
     user: CurrentUser,
 ) -> ReviewOut | None:
-    await get_catalog_recipe_or_404(db, catalog_recipe_id)
+    await require_catalog_recipe_access(
+        db, user_id=user.id, catalog_recipe_id=catalog_recipe_id
+    )
     review = await load_review(db, catalog_recipe_id=catalog_recipe_id, user_id=user.id)
     if review is None:
         return None
@@ -160,7 +153,9 @@ async def create_review(
     db: DB,
     user: CurrentUser,
 ) -> ReviewOut:
-    await get_catalog_recipe_or_404(db, catalog_recipe_id)
+    await require_catalog_recipe_access(
+        db, user_id=user.id, catalog_recipe_id=catalog_recipe_id
+    )
     review = Review(
         user_id=user.id,
         catalog_recipe_id=catalog_recipe_id,
@@ -190,7 +185,9 @@ async def update_my_review(
     db: DB,
     user: CurrentUser,
 ) -> ReviewOut:
-    await get_catalog_recipe_or_404(db, catalog_recipe_id)
+    await require_catalog_recipe_access(
+        db, user_id=user.id, catalog_recipe_id=catalog_recipe_id
+    )
     review = await load_review(db, catalog_recipe_id=catalog_recipe_id, user_id=user.id)
     if review is None:
         raise HTTPException(status_code=404, detail="Review not found")
@@ -212,7 +209,9 @@ async def delete_my_review(
     db: DB,
     user: CurrentUser,
 ) -> Message:
-    await get_catalog_recipe_or_404(db, catalog_recipe_id)
+    await require_catalog_recipe_access(
+        db, user_id=user.id, catalog_recipe_id=catalog_recipe_id
+    )
     review = await load_review(db, catalog_recipe_id=catalog_recipe_id, user_id=user.id)
     if review is None:
         raise HTTPException(status_code=404, detail="Review not found")
@@ -221,8 +220,10 @@ async def delete_my_review(
     await refresh_catalog_recipe_aggregates(db, catalog_recipe_id)
     await db.commit()
     for relative in photo_paths:
-        path = settings.upload_dir / relative
-        path.unlink(missing_ok=True)
+        try:
+            resolve_review_photo_file(relative).unlink(missing_ok=True)
+        except HTTPException:
+            pass
     return Message(detail="Review deleted")
 
 
@@ -237,24 +238,25 @@ async def add_review_photo(
     user: CurrentUser,
     file: UploadFile = File(...),
 ) -> ReviewOut:
-    await get_catalog_recipe_or_404(db, catalog_recipe_id)
+    await require_catalog_recipe_access(
+        db, user_id=user.id, catalog_recipe_id=catalog_recipe_id
+    )
     review = await load_review(db, catalog_recipe_id=catalog_recipe_id, user_id=user.id)
     if review is None:
         raise HTTPException(status_code=404, detail="Review not found")
     if len(review.photos) >= MAX_REVIEW_PHOTOS:
         raise HTTPException(status_code=400, detail="Maximum number of photos reached")
 
-    content_type = (file.content_type or "").lower()
-    suffix = ALLOWED_PHOTO_TYPES.get(content_type)
-    if suffix is None:
-        raise HTTPException(status_code=415, detail="Only JPEG, PNG, and WebP photos are supported")
-
-    data = await file.read(MAX_PHOTO_BYTES + 1)
+    data = await file.read(MAX_REVIEW_PHOTO_BYTES + 1)
     await file.close()
-    if len(data) > MAX_PHOTO_BYTES:
+    if len(data) > MAX_REVIEW_PHOTO_BYTES:
         raise HTTPException(status_code=413, detail="Photo exceeds 5MB limit")
     if not data:
         raise HTTPException(status_code=400, detail="Empty photo upload")
+    try:
+        data, _, suffix = normalize_review_photo(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
 
     relative_dir = Path("reviews") / str(review.id)
     absolute_dir = settings.upload_dir / relative_dir
@@ -274,7 +276,11 @@ async def add_review_photo(
             position=next_position,
         )
     )
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        absolute_path.unlink(missing_ok=True)
+        raise
     db.expire_all()
     loaded = await load_review(db, catalog_recipe_id=catalog_recipe_id, review_id=review_id)
     assert loaded is not None
@@ -286,8 +292,11 @@ async def get_review_photo(
     catalog_recipe_id: uuid.UUID,
     photo_id: uuid.UUID,
     db: DB,
+    user: CurrentUser,
 ) -> FileResponse:
-    """Serve review photos by opaque IDs (no bearer header available for <img>)."""
+    await require_catalog_recipe_access(
+        db, user_id=user.id, catalog_recipe_id=catalog_recipe_id
+    )
     photo = await db.scalar(
         select(ReviewPhoto)
         .join(Review, Review.id == ReviewPhoto.review_id)
@@ -318,6 +327,9 @@ async def delete_review_photo(
     db: DB,
     user: CurrentUser,
 ) -> ReviewOut:
+    await require_catalog_recipe_access(
+        db, user_id=user.id, catalog_recipe_id=catalog_recipe_id
+    )
     review = await load_review(db, catalog_recipe_id=catalog_recipe_id, user_id=user.id)
     if review is None:
         raise HTTPException(status_code=404, detail="Review not found")
@@ -328,7 +340,10 @@ async def delete_review_photo(
     storage_path = photo.storage_path
     await db.delete(photo)
     await db.commit()
-    (settings.upload_dir / storage_path).unlink(missing_ok=True)
+    try:
+        resolve_review_photo_file(storage_path).unlink(missing_ok=True)
+    except HTTPException:
+        pass
     db.expire_all()
     loaded = await load_review(db, catalog_recipe_id=catalog_recipe_id, review_id=review_id)
     assert loaded is not None

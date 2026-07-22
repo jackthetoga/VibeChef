@@ -22,7 +22,7 @@ async def categorize_ingredient(name: str) -> str | None:
     if known:
         return known
 
-    if not settings.openai_api_key:
+    if not settings.llm_enabled:
         return None
 
     categories = ", ".join(INGREDIENT_CATEGORIES)

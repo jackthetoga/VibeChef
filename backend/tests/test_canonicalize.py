@@ -18,6 +18,7 @@ async def test_canonicalize_batch_links_variants_and_preserves_compounds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(settings, "external_ai_enabled", True)
     captured_user = ""
 
     async def fake_chat_completion(**kwargs) -> str:
@@ -66,6 +67,7 @@ async def test_canonicalize_ignores_missing_and_invalid_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(settings, "external_ai_enabled", True)
 
     async def fake_chat_completion(**_kwargs) -> str:
         return '{"chopped basil": ["not", "a", "string"]}'

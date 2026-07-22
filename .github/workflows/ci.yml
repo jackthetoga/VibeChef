@@ -73,9 +73,7 @@ jobs:
       - name: Upgrade to head (all migrations must apply cleanly)
         run: alembic upgrade head
       - name: Detect model/migration drift
-        # Fails if models changed without a matching migration. Non-fatal for now
-        # (remove `|| true` once the schema is stable) but surfaces the warning.
-        run: alembic check || true
+        run: alembic check
 
   frontend:
     name: Frontend (oxlint + vitest + build)
@@ -96,5 +94,35 @@ jobs:
         run: npm run lint
       - name: Test (vitest)
         run: npm test
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
       - name: Build (tsc + vite — proves types compile)
         run: npm run build
+
+  security:
+    name: Security (dependencies + SAST)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install application and scanners
+        run: pip install -e . pip-audit bandit
+      - name: Audit installed Python dependencies
+        run: pip-audit --local
+      - name: Scan backend source
+        run: bandit -r app -ll
+      - name: Scan repository for vulnerable packages, secrets, and misconfiguration
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1

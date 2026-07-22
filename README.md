@@ -12,7 +12,7 @@ missing ingredient count.
 - PyMuPDF and ebooklib for text extraction
 - DeepSeek structured extraction, with a deterministic demo parser when no API key is set
 - React, TypeScript, Vite, TanStack Query, and Tailwind CSS
-- JWT access tokens with rotating refresh tokens for web and future Expo clients
+- JWT access tokens with rotating HttpOnly refresh cookies for the web client
 
 ## Run with Docker
 
@@ -20,6 +20,8 @@ Docker is the only prerequisite.
 
 ```bash
 cp backend/.env.example backend/.env
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+# Paste the generated value into SECRET_KEY in backend/.env.
 docker compose up --build
 ```
 
@@ -29,9 +31,19 @@ Open:
 - API docs: <http://localhost:8000/docs>
 - API health: <http://localhost:8000/api/v1/health>
 
-Set `OPENAI_API_KEY` in `backend/.env` to extract arbitrary cookbooks (defaults to
-DeepSeek via `OPENAI_BASE_URL` / `OPENAI_MODEL`). Without it, the worker uses a
-small deterministic parser intended for local development.
+Set `OPENAI_API_KEY` and explicitly opt in with `EXTERNAL_AI_ENABLED=true` in
+`backend/.env` to extract arbitrary cookbooks (defaults to DeepSeek via
+`OPENAI_BASE_URL` / `OPENAI_MODEL`). This sends cookbook text, pantry notes, and
+uploaded pantry/receipt images to the configured provider; review its retention
+and training terms before enabling it. Without opt-in, the app uses local
+deterministic fallbacks intended for development.
+
+PostgreSQL and Redis are private to the Compose network by default. To expose
+them on loopback for host-side development tools, opt in explicitly:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.host-access.yml up --build
+```
 
 ## Local development
 
@@ -84,9 +96,16 @@ requires downloading the full cookbook or matching ingredients in the browser.
 
 ## Production notes
 
-- Replace `SECRET_KEY` and database credentials.
+- Set `APP_ENV=production`; inject a unique `SECRET_KEY` and data-service
+  credentials from a secret manager. Startup rejects missing, placeholder, or
+  short signing keys.
 - Store uploads in private object storage (S3-compatible) instead of the local
   Docker volume.
 - Run migrations as a release step and run API and worker containers separately.
-- Place the API behind TLS and restrict `CORS_ORIGINS` to deployed clients.
+- Place only the web edge behind TLS; keep the API, worker, PostgreSQL, and
+  Redis on private networks. Restrict `CORS_ORIGINS` and `ALLOWED_HOSTS` to the
+  deployed hostname.
 - Use a managed PostgreSQL and Redis service with backups and monitoring.
+- Enforce provider-side LLM spend limits in addition to application quotas.
+- The production backend image runs as a non-root user and excludes test/lint
+  dependencies; do not deploy the development Compose targets.

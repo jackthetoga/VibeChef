@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.services.rate_limits import consume_global_llm_quota
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +26,9 @@ async def chat_completion(
 
     ``user`` may be a plain string or a multimodal content list (text + image_url parts).
     """
-    if not settings.openai_api_key:
-        raise RuntimeError("OPENAI_API_KEY is not configured")
+    if not settings.llm_enabled:
+        raise RuntimeError("External AI processing is not enabled")
+    await consume_global_llm_quota()
 
     payload: dict = {
         "model": settings.openai_model,
